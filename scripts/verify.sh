@@ -193,26 +193,38 @@ for DMG in ${DMGS[@]+"${DMGS[@]}"}; do
   else
     fail "dmg carries a volume icon (custom-icon bit set)"
   fi
-  # Finder draws a background at its own size and does not scale it to the window, so the background
-  # has to be a 1x/@2x pair whose 1x is exactly the window size; a single-resolution image larger
-  # than the window shows only its top-left corner. dmgbuild only combines the pair when it finds an
-  # @2x beside the 1x, so this asserts the multi-resolution result is really what shipped.
-  # (make-dmg.py additionally checks the 1x representation against the recorded window bounds.)
-  BACKGROUND_FILE="$(ls "$MOUNT"/.background.* 2>/dev/null | head -1)"
-  BACKGROUND_RESOLUTIONS=""
-  [ -n "$BACKGROUND_FILE" ] && BACKGROUND_RESOLUTIONS="$(tiffutil -info "$BACKGROUND_FILE" 2>/dev/null | grep -c 'Image Width')"
-  if [ "${BACKGROUND_RESOLUTIONS:-0}" -ge 2 ]; then
-    pass "dmg background is a multi-resolution (1x/@2x) image"
-  else
-    fail "dmg background is not a 1x/@2x pair (Finder would not scale it to the window)"
-  fi
+  # The two checks below only apply to the styled installer. package.sh builds that one when the
+  # optional dmgbuild tooling is installed, and a plain window otherwise — so demanding the layout
+  # unconditionally meant a fresh clone with no .venv failed its own verification suite, with two
+  # FAILs that looked like regressions but were the documented fallback working as designed.
+  #
+  # The condition mirrors package.sh's exactly, so this still fails loudly when the tooling *is*
+  # present and the styled image nevertheless came out plain — which is the case worth catching.
+  if [ -x "$ROOT/.venv/bin/python" ] && [ -f "$ROOT/Resources/dmg-background.png" ]; then
+    # Finder draws a background at its own size and does not scale it to the window, so the
+    # background has to be a 1x/@2x pair whose 1x is exactly the window size; a single-resolution
+    # image larger than the window shows only its top-left corner. dmgbuild only combines the pair
+    # when it finds an @2x beside the 1x, so this asserts the multi-resolution result really shipped.
+    # (make-dmg.py additionally checks the 1x representation against the recorded window bounds.)
+    BACKGROUND_FILE="$(ls "$MOUNT"/.background.* 2>/dev/null | head -1)"
+    BACKGROUND_RESOLUTIONS=""
+    [ -n "$BACKGROUND_FILE" ] && BACKGROUND_RESOLUTIONS="$(tiffutil -info "$BACKGROUND_FILE" 2>/dev/null | grep -c 'Image Width')"
+    if [ "${BACKGROUND_RESOLUTIONS:-0}" -ge 2 ]; then
+      pass "dmg background is a multi-resolution (1x/@2x) image"
+    else
+      fail "dmg background is not a 1x/@2x pair (Finder would not scale it to the window)"
+    fi
 
-  # The drag-and-drop layout is a .DS_Store at the root of the image: icon positions, the background
-  # and the window size. Without it the DMG still mounts but looks like a plain folder.
-  if [ -f "$MOUNT/.DS_Store" ]; then
-    pass "dmg carries a drag-and-drop layout (.DS_Store)"
+    # The drag-and-drop layout is a .DS_Store at the root of the image: icon positions, the
+    # background and the window size. Without it the DMG still mounts but looks like a plain folder.
+    if [ -f "$MOUNT/.DS_Store" ]; then
+      pass "dmg carries a drag-and-drop layout (.DS_Store)"
+    else
+      fail "dmg carries a drag-and-drop layout (.DS_Store)"
+    fi
   else
-    fail "dmg carries a drag-and-drop layout (.DS_Store)"
+    note "no .venv with dmgbuild, so package.sh built the plain installer: skipping the layout and background checks"
+    note "run scripts/setup-dmg-tools.sh for the drag-and-drop window"
   fi
   check "app inside the dmg is signed" "codesign --verify --strict '$MOUNT/$APP_NAME.app'"
   check "app inside the dmg keeps its LSUIElement flag" \

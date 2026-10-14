@@ -133,6 +133,14 @@ Gotchas worth keeping:
 * A mounted image keeps serving the bytes it was opened with, so `package.sh` refuses to repackage
   while a NeoDrop DMG is mounted. Use `--force` to override. `verify.sh` instead *reuses* an existing
   mount (its checks are read-only) rather than reporting a false `Resource busy` failure.
+* The layout and background checks in `verify.sh` are conditional on the same thing `package.sh`
+  tests for — `.venv/bin/python` plus `Resources/dmg-background.png`. Demanding them
+  unconditionally made a fresh clone with no `dmgbuild` fail its own suite with two FAILs that were
+  the documented plain-installer fallback working as designed. The condition still fails loudly when
+  the tooling *is* present and the image came out plain, which is the regression worth catching.
+* `verify.sh --smoke` launches the app with `NEODROP_HOME` pointed at a scratch directory. Without
+  that it runs against the developer's real config and log, with their folder watchers live — a
+  "smoke test" that could mirror files for real.
 
 ## Conventions
 
