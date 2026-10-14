@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: packaging/../scripts/package.sh substitutes @VERSION@ (full, e.g. 1.0.0),
+     @SHORT_VERSION@ (numeric X.Y.Z), @BUILD_SHA@ and @MIN_OS@.
+
+     NeoDrop is a menu bar app with no Dock presence and no main menu, so LSUIElement is set.
+     It is deliberately NOT sandboxed: reaching mounted network shares under /Volumes and
+     writing to them is the entire point of the app, and the App Sandbox would block it. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>NeoDrop</string>
+  <key>CFBundleName</key>
+  <string>NeoDrop</string>
+  <key>CFBundleExecutable</key>
+  <string>NeoDrop</string>
+  <key>CFBundleIdentifier</key>
+  <string>ai.storyteller.neodrop</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleSignature</key>
+  <string>????</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@SHORT_VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@SHORT_VERSION@</string>
+  <key>NeoDropVersion</key>
+  <string>@VERSION@</string>
+  <key>NeoDropBuildCommit</key>
+  <string>@BUILD_SHA@</string>
+  <key>CFBundleIconFile</key>
+  <string>NeoDrop</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.utilities</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>@MIN_OS@</string>
+  <!-- Menu bar only: no Dock icon, no app switcher entry. -->
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSHumanReadableCopyright</key>
+  <string>NeoDrop</string>
+  <key>NSSupportsAutomaticTermination</key>
+  <false/>
+  <key>NSSupportsSuddenTermination</key>
+  <false/>
+</dict>
+</plist>

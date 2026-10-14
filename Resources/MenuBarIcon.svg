@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Simple single-colour NAS chassis, designed for macOS template tinting -->
+<rect x="5" y="10" width="54" height="44" rx="7" fill="black"/>
+<rect x="11" y="16" width="42" height="32" rx="3" fill="white"/>
+<rect x="15" y="19" width="9" height="26" rx="2.5" fill="black"/>
+<rect x="27.5" y="19" width="9" height="26" rx="2.5" fill="black"/>
+<rect x="40" y="19" width="9" height="26" rx="2.5" fill="black"/>
+<rect x="18" y="23" width="3" height="4" rx="1.5" fill="white"/>
+<rect x="30.5" y="23" width="3" height="4" rx="1.5" fill="white"/>
+<rect x="43" y="23" width="3" height="4" rx="1.5" fill="white"/>
+</svg>

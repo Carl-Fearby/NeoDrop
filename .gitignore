@@ -1,0 +1,21 @@
+# Build output: the app bundle, generated icon, DMGs and scratch state all land here.
+build/
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
+._*
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+
+# No secrets should ever be committed; NeoDrop stores no credentials, but be explicit.
+.env
+*.key
+*.p12
+
+# Build-time tooling for the styled DMG (scripts/setup-dmg-tools.sh)
+.venv/
