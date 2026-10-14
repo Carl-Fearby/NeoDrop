@@ -274,8 +274,14 @@ Deliberate omissions, roughly in order of value:
   replica, but there is no "the source was lost, put it back" button yet.
 * **Bandwidth and time windows.** No throttling and no "only sync overnight" yet.
 * **Per-file progress UI.** The menu shows counts and the current path, not a list of queued files.
-* **A bespoke menu bar glyph.** The title bar uses an SF Symbol so it matches the system in light
-  and dark mode. A custom *template* image — a simplified four-bay NAS silhouette derived from the
-  app icon — would tie the two together, but it needs checking at 16px in both appearances.
 * **Art direction for small sizes.** The icon is one image scaled to every size, as macOS does by
   default. Real icon sets simplify at 16–32px, where a detailed render turns to mush.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). It covers the code and the artwork, so you are free to fork it, strip
+it down to the parts you want, or ship your own version.
+
+What it does not change: the app is ad-hoc signed, not notarized, so a build from this source still
+needs the one-time Gatekeeper approval described above unless you sign it with your own Apple
+Developer account.

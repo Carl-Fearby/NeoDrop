@@ -133,6 +133,9 @@ Gotchas worth keeping:
 * A mounted image keeps serving the bytes it was opened with, so `package.sh` refuses to repackage
   while a NeoDrop DMG is mounted. Use `--force` to override. `verify.sh` instead *reuses* an existing
   mount (its checks are read-only) rather than reporting a false `Resource busy` failure.
+* NeoDrop is **MIT licensed** (`LICENSE`), covering the code and the artwork. Keep that file intact
+  and keep any dependency licence-compatible — the permissive choice is deliberate, and it is what
+  lets somebody fork this or lift the engine into their own tool.
 * The layout and background checks in `verify.sh` are conditional on the same thing `package.sh`
   tests for — `.venv/bin/python` plus `Resources/dmg-background.png`. Demanding them
   unconditionally made a fresh clone with no `dmgbuild` fail its own suite with two FAILs that were
