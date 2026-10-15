@@ -52,8 +52,11 @@ source folders ──► scan + SHA-256 ──► plan ──► per-replica dif
                                               repair: rewrite what fails, from the best copy
 ```
 
-One Swift package, two targets: `NeoDropCore` (engine, no AppKit, fully testable) and `NeoDrop`
-(status item + SwiftUI settings).
+One Swift package: `NeoDropCore` (engine, no AppKit, fully testable), `NeoDropShared` (the badge
+format, so the app and the Finder extension cannot disagree about what a badge means), `NeoDrop`
+(status item + SwiftUI settings) and the tests. The Finder Sync extension is not an SPM target —
+SwiftPM has no app-extension product type — so `scripts/package.sh` compiles it into
+`NeoDrop.app/Contents/PlugIns/`.
 
 ### Deleted files
 
@@ -154,9 +157,13 @@ reached for one does not stop the other.
 
 ```bash
 swift build                 # library + app
-swift test                  # 146 engine tests
+swift test                  # 187 engine tests: 186 green, one failing on purpose (see the badges below)
 swift run NeoDrop           # menu bar icon appears immediately (reads/writes ~/Library/Application Support/NeoDrop)
 ```
+
+`swift run` builds the app and nothing else. The Finder extension is a separate bundle that SwiftPM
+has no product type for, so `scripts/package.sh` compiles and embeds it — a source run syncs fine and
+simply shows no badges.
 
 ## Create an installer DMG
 
@@ -167,9 +174,12 @@ scripts/package.sh --arch universal     # Intel + Apple Silicon
 scripts/verify.sh --smoke               # structural checks plus a real 4-second launch
 scripts/e2e.sh                          # drives the packaged app against simulated NAS folders
 scripts/e2e-vault.sh                    # two real installs, one vault: edits both ways, a Mac joining, a deletion
+scripts/install.sh                      # after building: into /Applications, Finder extension switched on
 ```
 
-Output: `build/NeoDrop.app` and `build/neodrop-<version>-macos-<arch>.dmg`.
+Output: `build/NeoDrop.app` and `build/neodrop-<version>-macos-<arch>.dmg`. Drag-installing the DMG
+does the first half of what `install.sh` does; the second half — turning the Finder extension on — is
+done by hand in System Settings unless you run the script.
 
 ### The drag-and-drop installer window
 
@@ -241,8 +251,8 @@ either — Apple removed it. So a DMG you hand to a friend behaves like this:
 1. They drag NeoDrop into Applications (the DMG includes the `/Applications` drop target).
 2. First launch shows *"Apple could not verify NeoDrop is free of malware."*
 3. They approve it once: **System Settings → Privacy & Security → scroll down → Open Anyway**.
-   The window shows a `Read Me First.txt` with exactly this instruction, in the free corner at the
-   top right of the installer artwork.
+   The window shows a `Read Me First.txt` with exactly this instruction — the leftmost of the three
+   icons, beside NeoDrop.app and the `Applications` drop target.
 
 To skip that step, either:
 
@@ -361,15 +371,15 @@ says so rather than implying more.
 Dropbox-shaped: in Finder, a folder or file NeoDrop protects carries a small icon next to its date,
 so the state is visible without opening anything.
 
-| Icon | Meaning |
-| --- | --- |
-| Green tick | Here, and copied to every destination NeoDrop recorded |
-| Clock | Here, but not everywhere yet — new or edited since the last sync, or a destination was away when it ran (**Sync Now** is the fix) |
-| Spinning arrows | NeoDrop is reading or writing this file right now |
-| Orange triangle | A destination copy is missing or no longer matches the record — run **Verify & Repair** |
-| Trash | Bytes NeoDrop is deliberately holding after a deletion, recoverable from **Deleted Files…** |
-| Question mark | On a destination but not written by NeoDrop: somebody put it there by hand, and NeoDrop will not delete or overwrite it |
-| Dash | Nothing to do with NeoDrop, inside a protected folder but matching an ignore pattern |
+| Icon | Meaning | When you actually see it |
+| --- | --- | --- |
+| Green tick | Here, and copied to every destination NeoDrop recorded | The default, everywhere inside a protected folder |
+| Clock | Here, but not everywhere yet — new or edited since the last sync, or a destination was away when it ran (**Sync Now** is the fix) | Every file you edit, until the next sync |
+| Spinning arrows | NeoDrop is reading or writing this file right now | Only while a sync is running and the app has republished the index mid-run |
+| Orange triangle | A destination copy is missing or no longer matches the record — run **Verify & Repair** | A copy that was deleted or replaced by hand |
+| Trash | Bytes NeoDrop is deliberately holding after a deletion, recoverable from **Deleted Files…** | On a destination's `.neodrop-trash/` folder, not per retained file |
+| Question mark | On a destination but not written by NeoDrop: somebody put it there by hand, and NeoDrop will not delete or overwrite it | **Not yet** — the shape is defined, but nothing publishes it |
+| Dash | Nothing to do with NeoDrop, inside a protected folder but matching an ignore pattern | **Not yet** — the shape is defined, but nothing publishes it |
 
 A file outside every protected folder gets no icon at all — a badge on everything would say nothing.
 A folder shows the worst of what is inside it, so one file needing attention is visible from the
@@ -385,10 +395,10 @@ whether or not the extension can be told about it.
 
 This is a Finder extension, so it has to be switched on once: `scripts/install.sh` does it for you,
 or **System Settings → General → Login Items & Extensions → Finder Extensions → NeoDrop**. The
-badges come from NeoDrop's own records — nothing is hashed and no folder is walked to draw them — so
-they appear the moment the state changes, and they are honest about *when* they last knew something.
-With no folders configured there is nothing to badge, and nothing is drawn: a green tick on no
-evidence is the one lie a badge must not tell.
+badges come from NeoDrop's own records — nothing is hashed and no folder is walked to draw them — and
+where they are drawn they are honest about *when* they last knew something. With no folders
+configured there is nothing to badge, and nothing is drawn: a green tick on no evidence is the one
+lie a badge must not tell.
 
 ### Trying it without a NAS
 
@@ -409,6 +419,8 @@ Sources/NeoDropCore/     engine: scanning, hashing, mirroring, verification, rep
                          retained versions, the local cursor
   VaultSync.swift        the two-way reconciler: publish, apply, seed, adopt, conflicts
   FileStatus.swift       "is this file safe?": every copy, what was recorded for it, its history
+  FinderStatusBuilder.swift  the badge index the Finder extension reads, from records NeoDrop
+                         already has — no hashing and no directory walk
   WebUIServer.swift      loopback HTTP server behind the deleted-files and file-status windows
   WebUIPage.swift        both pages: self-contained documents, rendered or fetched over loopback
   Scanner.swift          enumeration, excludes, cached source hashes
@@ -423,7 +435,8 @@ Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, the 
   VaultStatus.swift      per-folder display state for the menu and Settings
 Sources/NeoDropShared/   the badge format, shared by the app and the Finder extension
 Sources/NeoDropFinder/   the Finder Sync extension: the badges next to a file's date
-Tests/NeoDropCoreTests/  187 tests, including one per safety rule above
+Tests/NeoDropCoreTests/  187 tests: one per safety rule above, plus the vault, web-UI parsing, path
+                         and badge cases. The container-channel one fails on purpose — see AGENTS.md
 Resources/AppIcon.png    master app-icon artwork, masked by scripts/make-icon.swift
 Resources/MenuBarIcon*.png  menu bar template icon at 1x/2x/3x, plus the .svg master
 Resources/dmg-background.png  installer window wallpaper, as supplied (the master)
@@ -437,7 +450,7 @@ scripts/                 build, icon generation, packaging, verification, e2e, f
   install.sh             copy into /Applications and switch the Finder extension on
   reset.sh               the clean-install path: removes this Mac's state, never your data
   setup-dmg-tools.sh     installs dmgbuild into .venv (optional, for the layout)
-packaging/               Info.plist template, entitlements
+packaging/               Info.plist and entitlements templates, for the app and the extension
 build/                   generated: NeoDrop.app, .icns, .dmg
 ```
 
@@ -461,7 +474,7 @@ scripts/reset.sh --yes          # carries it out
 scripts/reset.sh --yes --trash  # moves the state to the Trash instead, so it can be undone
 ```
 
-The app must be quit first (the script checks and refuses). Three paths go:
+The app must be quit first (the script checks and refuses). Four paths go:
 
 | Path | What it holds |
 | --- | --- |
@@ -490,7 +503,13 @@ pointing two of them at one vault is how `scripts/e2e-vault.sh` runs two machine
 
 ## Not built yet
 
-Deliberate omissions, roughly in order of value:
+Deliberate omissions and known gaps, roughly in order of value:
+
+* **A channel from the app to the Finder extension that survives an app update.** The badges are
+drawn and correct, but the index cannot reach the extension once macOS seals its sandbox container —
+including after any update. AGENTS.md records the measurements and the two channels that can work (an
+XPC Mach service from the app, or a sandboxed app with a team-signed App Group). Until then the
+badges work on a fresh install and go quiet at the first update.
 
 * **File history / versioning, in mirror mode.** A deletion is recoverable for 30 days everywhere,
   and a two-way folder keeps the previous contents of anything it overwrites in `.neodrop/versions/`

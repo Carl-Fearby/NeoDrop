@@ -15,7 +15,7 @@ server and no cloud component.
 
 ```bash
 swift build                                        # compile everything
-swift test                                         # 187 engine tests, must stay green
+swift test                                         # 187 engine tests: 186 green, one failing on purpose
 swift run NeoDrop                                  # run the app (menu bar icon)
 swift build -c release --show-bin-path             # locate the release binary
 scripts/package.sh [--arch universal] [--no-dmg]   # .app + DMG, ad-hoc signed by default
