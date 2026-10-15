@@ -249,10 +249,11 @@ NOTE
   # The layout, the background and the icon positions all live in the image's .DS_Store, which is
   # written by dmgbuild (scripts/make-dmg.py). AppleScript driving Finder would need Automation
   # permission and a GUI session; dmgbuild works headlessly and verifies its own output.
-  # The largest icon size Finder is known to honour. Nothing documented pins this down; 256 is
-  # inside every published range for icon view (the slider is described as reaching 512), and an
-  # over-large value is silently clamped rather than refused — which would leave the painted icons
-  # sticking out from behind the real ones. So the artwork is scaled to fit this instead.
+  # The largest icon size this build will ask for. Nothing documented pins the ceiling down, so it
+  # stays conservative: measured on macOS 26 by capturing a mounted window, Finder honours 320 and 384
+  # exactly, and the size the layout asks for is 254. Keeping the ask below 256 means an over-large
+  # value is never silently clamped, which would leave the window at some size other than the one its
+  # background was drawn for.
   MAX_ICON_SIZE=256
 
   if [ -x "$ROOT/.venv/bin/python" ] && [ -f "$ROOT/Resources/dmg-background.png" ]; then
@@ -261,33 +262,25 @@ NOTE
     ARTWORK="$ROOT/Resources/dmg-background.png"  # the master art, as supplied
     BACKGROUND="$BUILD/dmg-background.png"        # 1x; make-dmg.py's dmgbuild finds the @2x beside it
 
-    # Three measured passes, each feeding the next — none of these numbers is guessed:
-    #   1. measure the master art      → the icon size its painted icons imply
-    #   2. scale the art to fit        → a 1x/@2x background pair at that size
-    #   3. re-measure the pair         → the window and icon positions, in view points
-    # Pass 3 is not redundant with pass 1: scaling rounds to whole pixels, so the final icon size
-    # drifts by a point or two and has to be read back rather than predicted.
-    swift "$ROOT/scripts/dmg-layout.swift" "$ARTWORK" --json > "$LAYOUT.master"
-    swift "$ROOT/scripts/make-dmg-background.swift" --source "$ARTWORK" \
-      --layout "$LAYOUT.master" --out "$BACKGROUND" --limit "$MAX_ICON_SIZE" \
-      || warn "could not derive the background pair from the master artwork"
-    # The @2x sibling's exact name, computed the same way make-dmg-background.swift writes it.
-    # ("$VAR@2x.png" would expand to dmg-background.png@2x.png and silently measure the master.)
+    # The background is the supplied wallpaper, cropped to cover the window and darkened so Finder
+    # draws white labels on it. Nothing is drawn on top: every element an earlier artwork drew (copies
+    # of the icons, an arrow, a caption) was something the real icons could disagree with.
+    BACKGROUND_JSON="$BUILD/dmg-background.json"
+    : > "$BACKGROUND_JSON"
+    # The crops describe themselves: the same run writes the layout the icons are placed from, so the
+    # background and the positions can never be measured from different images.
+    swift "$ROOT/scripts/make-dmg-artwork.swift" --source "$ARTWORK" \
+      --out "$BACKGROUND" --layout-out "$LAYOUT" --json > "$BACKGROUND_JSON" \
+      || warn "could not draw the installer background"
     BACKGROUND_2X="${BACKGROUND%.*}"@2x."${BACKGROUND##*.}"
-    if [ -f "$BACKGROUND_2X" ]; then
-      swift "$ROOT/scripts/dmg-layout.swift" "$BACKGROUND_2X" --json > "$LAYOUT"
-    else
-      warn "no ${BACKGROUND_2X} to measure; the artwork was not scaled"
-      cp "$LAYOUT.master" "$LAYOUT"
-    fi
-    # Read back the numbers pass 3 actually measured; a layout whose icon size exceeds the limit
-    # would ship the doubled-icon artefact, so that case refuses rather than warns.
+    # Read back the numbers it recorded; a layout whose icon size exceeds the limit would ship the
+    # doubled-icon artefact, so that case refuses rather than warns.
     ICON_SIZE="$("$ROOT/.venv/bin/python" -c "import json;print(json.load(open('$LAYOUT'))['iconSize'])" 2>/dev/null || echo 0)"
     WINDOW_WIDTH="$("$ROOT/.venv/bin/python" -c "import json;print(json.load(open('$LAYOUT'))['window']['width'])" 2>/dev/null || echo 0)"
     info "installer window ${WINDOW_WIDTH}pt wide, icon size ${ICON_SIZE}pt (limit $MAX_ICON_SIZE)"
     if [ "$ICON_SIZE" -gt "$MAX_ICON_SIZE" ]; then
-      warn "the painted icons imply an icon size above $MAX_ICON_SIZE, which Finder may clamp"
-      warn "that would leave the painted icons visible around the real ones, so no styled image was built"
+      warn "the layout asks for an icon size above $MAX_ICON_SIZE, which Finder may clamp"
+      warn "that would leave the icons somewhere other than where the background expects them"
       LAYOUT="/nonexistent"
     fi
     if [ -f "$LAYOUT" ] && "$ROOT/.venv/bin/python" "$ROOT/scripts/make-dmg.py" \

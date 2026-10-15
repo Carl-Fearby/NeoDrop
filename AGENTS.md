@@ -21,10 +21,8 @@ scripts/e2e.sh [--keep]                            # drive the packaged app agai
 scripts/fake-nas.sh create 3 | destroy | list      # real mounted volumes to test against
 swift scripts/make-icon.swift build/NeoDrop.icns --source Resources/AppIcon.png --verify
 swift scripts/verify-menubar-icon.swift                        # menu bar template icon checks
-swift scripts/dmg-layout.swift Resources/dmg-background.png   # measure the master artwork
-swift scripts/make-dmg-background.swift --source Resources/dmg-background.png \
-    --layout build/dmg-layout.json --out build/dmg-background.png --limit 256
-swift scripts/dmg-layout.swift build/dmg-background@2x.png    # re-measure the scaled pair
+swift scripts/make-dmg-artwork.swift --source Resources/dmg-background.png \
+    --out build/dmg-background.png --layout-out build/dmg-layout.json   # background pair + layout
 scripts/setup-dmg-tools.sh                                    # one-off: .venv + dmgbuild
 ./.venv/bin/python scripts/make-dmg.py --app build/NeoDrop.app --output build/x.dmg \
     --background build/dmg-background.png --layout build/dmg-layout.json \
@@ -123,20 +121,19 @@ a GUI session (it hangs in a headless build), so `scripts/make-dmg.py` uses `dmg
 into `.venv/` by `scripts/setup-dmg-tools.sh`. That is the only non-Apple build dependency and it
 is optional: without it `package.sh` builds a plain DMG.
 
-The installer artwork has a NeoDrop icon and an Applications folder *painted into it*, so the real
-icons must be placed exactly on top of the painted ones. Never hard-code those coordinates:
-`scripts/dmg-layout.swift` measures them from the image, and `make-dmg.py` verifies the finished
-`.DS_Store` — each real icon must cover its painted twin and must not cover the arrow or the
-caption. Finder draws icons square, so the icon size comes from the taller axis of the painted app
-icon, not its width, and it only fills ~80% of the box it is given (Apple's 1024 canvas has an 824
-body), so the requested `icon_size` is the painted tile divided by 824/1024. Comparing the nominal
-box against the painted tile instead — which reads as the obvious check — passes on an image that
-visibly shows the painted icon around every edge.
+Nothing is drawn on the installer background. It is the wallpaper supplied in
+`Resources/dmg-background.png`, cropped to cover the window and darkened — and that is deliberately
+all. Every earlier attempt drew something (copies of the icons for the real ones to land on, the
+artwork's glyphs, an arrow, a caption) and every one of those elements became something the real
+icons could disagree with: doubled icons, a caption the labels crossed, art scaled until the painted
+tiles no longer lined up with the icons. Do not put anything back on it.
 
-The background is built, not shipped raw: `scripts/make-dmg-background.swift` writes a 1x/@2x pair
-and `package.sh` measures the master, scales it, then measures the pair again, because scaling
-rounds to whole points and the final icon size drifts a point or two from the predicted one. Pass 3
-is what `make-dmg.py` consumes.
+One pass writes both the background pair and the layout, so they cannot contradict each other:
+`scripts/make-dmg-artwork.swift` crops the wallpaper to a 960x458 point window, writes
+`build/dmg-background.png` plus its `@2x`, and writes `build/dmg-layout.json` describing the window
+and the three slots — `Read Me First.txt` on the left, NeoDrop.app in the middle, `Applications` on
+the right. `make-dmg.py` then mounts the finished image, reads its `.DS_Store` back, and asserts each
+icon's box and label sit inside the window and clear each other.
 
 Gotchas worth keeping:
 
@@ -149,9 +146,16 @@ Gotchas worth keeping:
   combines a 1x/@2x pair when the `@2x` sits beside the 1x and produces `.background.tiff`; given
   one image it silently copies it. Both `make-dmg.py` and `verify.sh` assert the multi-resolution
   result, and `make-dmg.py` asserts the 1x representation equals the recorded window bounds.
-* An unsupported `icon_size` is silently clamped by Finder, so an over-large value reintroduces the
-  doubled icon rather than failing. The artwork is scaled to keep the implied size ≤ 256; `package.sh`
-  refuses to build a styled image if it is not.
+* An unsupported `icon_size` is silently clamped by Finder. The layout asks for 254 points, which is
+  under the 256 `package.sh` treats as the ceiling, and refuses to build a styled image above it.
+* Finder chooses the label colour from the background picture: white with a shadow over a dark one,
+  dark grey over a bright one. The wallpaper is multiplied down to 55% brightness for exactly this
+  reason — a brighter version drew grey labels over mid-blue wave that could barely be read. If the
+  labels ever come out grey again, the background got brighter, not the fonts.
+* `Read Me First.txt` is **shown in the window**, in the left slot. It was hidden for a while ("the
+  instructions should not clutter the window"), which is why `verify.sh` asserts the file is not
+  carrying the hidden flag. `make-dmg.py` fails if it is not in its slot, or if its icon or label
+  would touch another slot.
 * In bash, `"$VAR@2x.png"` expands to `dmg-background.png@2x.png`, not `dmg-background@2x.png` — it
   silently measured the master artwork and produced a layout for a window that no longer existed.
   Use `"${VAR%.*}"@2x."${VAR##*.}"`.

@@ -161,6 +161,15 @@ mountpoint_of_attached() {
   '
 }
 
+# A suite that passes with nothing to verify is worse than one that fails: after a build that never
+# produced an image (a --no-dmg run, or a build that stopped early) every DMG check silently does not
+# run, and "All checks passed" then says nothing about the installer at all.
+if [ "${#DMGS[@]}" -eq 0 ]; then
+  echo
+  note "no DMG in build/ to verify — the installer checks did not run"
+  note "build one with scripts/package.sh (a --no-dmg build has no image to check)"
+fi
+
 for DMG in ${DMGS[@]+"${DMGS[@]}"}; do
   echo
   echo "DMG: $DMG"
@@ -183,6 +192,14 @@ for DMG in ${DMGS[@]+"${DMGS[@]}"}; do
   [ -L "$MOUNT/Applications" ] && pass "dmg has an /Applications drop target" || fail "dmg has an /Applications drop target"
   [ -f "$MOUNT/Read Me First.txt" ] && pass "dmg includes first-launch instructions" \
     || fail "dmg includes first-launch instructions"
+  # Present is not the same as shown: Finder hides the file when it carries the hidden flag, and that
+  # flag lives on the file itself rather than in the .DS_Store. The instructions sat hidden for a
+  # while, so this asserts the state the window is supposed to be in.
+  if ls -lO "$MOUNT/Read Me First.txt" 2>/dev/null | grep -q hidden; then
+    fail "Read Me First.txt is hidden, so it would not appear in the window"
+  else
+    pass "Read Me First.txt is visible in the window"
+  fi
   # Whether Finder actually draws it needs a human eye; presence plus the custom-icon bit is what
   # this can prove. That bit is byte 8 of com.apple.FinderInfo (kHasCustomIcon = 0x04); without it
   # Finder ignores .VolumeIcon.icns and falls back to the generic disk icon, so checking only for

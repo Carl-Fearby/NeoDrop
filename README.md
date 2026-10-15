@@ -99,9 +99,10 @@ Output: `build/NeoDrop.app` and `build/neodrop-<version>-macos-<arch>.dmg`.
 
 ### The drag-and-drop installer window
 
-Opening the DMG shows the artwork in `Resources/dmg-background.png` with the real NeoDrop.app on
-the left, a real `Applications` drop target on the right, and the painted arrow and caption
-between them.
+Opening the DMG shows the wallpaper in `Resources/dmg-background.png` with three evenly spaced
+icons across a 960x458 point window: `Read Me First.txt`, the real NeoDrop.app, and a real
+`Applications` drop target. Nothing is drawn on the wallpaper — the only thing on it is the
+wallpaper itself, cropped to cover.
 
 The layout lives in a binary `.DS_Store` at the root of the image, which Finder reads for icon
 positions, the background picture and the window size. Two ways to write it exist:
@@ -113,44 +114,43 @@ positions, the background picture and the window size. Two ways to write it exis
   uses. It is the only non-Apple build dependency, it is optional, and the app itself has no Python
   dependency. Without `.venv/`, `package.sh` still produces a working (plain) DMG.
 
-The artwork already has a NeoDrop icon and an Applications folder *painted into it*, so the real
-icons have to land exactly on top of those or you get four icons in the window. Their positions are
-measured from the image rather than guessed: `scripts/dmg-layout.swift` thresholds the artwork,
-finds the two icon-shaped regions, and reports their centres and sizes. `make-dmg.py` then mounts
-the finished DMG, reads the `.DS_Store` back, and asserts that each real icon covers its painted
-twin and that neither covers the arrow or the caption.
+Earlier versions used an artwork that had a NeoDrop icon, an Applications folder and an arrow
+*painted into it*, and placed the real icons on top of their painted twins. Every element the
+background draws is something the icons can disagree with, and each one did: doubled icons, a
+caption the labels crossed, a scaled-down art whose icons no longer lined up. That is all gone —
+there is no measuring pass left to disagree with anything.
 
-Three measured passes feed each other, and `package.sh` runs all of them:
+One pass writes both halves of what the window needs, so they cannot drift apart:
 
 ```
-Resources/dmg-background.png ──measure──▶ the icon size the painted icons imply
-                             ──scale────▶ build/dmg-background.png + @2x  (the 1x/@2x pair)
-                             ──measure──▶ build/dmg-layout.json           (window + icon positions)
+Resources/dmg-background.png ──crop to cover──▶ build/dmg-background.png + @2x   (the 1x/@2x pair)
+                             ──describe──────▶ build/dmg-layout.json            (window + 3 slots)
 ```
 
-Two details decide whether the window looks like the artwork, and both are easy to get wrong:
+Three details decide whether the window looks right, and all three are easy to get wrong:
 
 **The background is a 1x/@2x pair, and the 1x is exactly the window size.** Finder draws a window
-background at its own size instead of scaling it, so handing it the master artwork left it showing
-only the top-left corner of the picture. The window is therefore 611x458 points with a 611x458
-background and a 1222x916 `@2x` partner; dmgbuild finds the pair and combines them into a
-multi-resolution TIFF (611x458 at 72 dpi, 1222x916 at 144 dpi) exactly as `tiffutil -cathidpicheck`
+background at its own size instead of scaling it, so handing it the master wallpaper left it showing
+only the top-left corner of the picture. The window is therefore 960x458 points with a 960x458
+background and a 1920x916 `@2x` partner; dmgbuild finds the pair and combines them into a
+multi-resolution TIFF (960x458 at 72 dpi, 1920x916 at 144 dpi) exactly as `tiffutil -cathidpicheck`
 does for AppKit.
 
+**The wallpaper is darkened, and that is what makes the labels white.** Finder picks the label
+colour from the background: dark text over a bright picture, white with a shadow over a dark one.
+On the undarkened wallpaper the labels came out dark grey over mid-blue wave and were hard to read,
+so the composition multiplies the picture down to 55% brightness. That keeps the waves and the hue
+and puts Finder back on white labels.
+
 **The icon size has to account for the icon body grid.** A drawn app icon only fills about 80% of
-the box it is asked for (Apple's canvas is 1024 with an 824 body), so asking for the painted tile's
-own size would leave that tile peeking out all the way round the real icon — a doubled icon. The
-requested size is the painted tile divided by 0.8047 (235x239 painted, so from the taller axis).
-That works out to ~300 points for the master artwork, which is past the largest icon size Finder is
-known to honour (256 — the icon-view slider is described as reaching 512, but an unsupported value
-is *silently clamped*, which would put the doubling back). So `make-dmg-background.swift` scales the
-artwork down by 15% until the implied size fits, which is where 611x458 comes from.
+the box it is asked for (Apple's canvas is 1024 with an 824 body), so the size asked for is the
+190pt paint slot divided by 0.8047, which is 254 points — under the largest icon size Finder is
+known to honour (256; the icon-view slider is described as reaching 512, but an unsupported value
+is *silently clamped*).
 
 ```bash
-swift scripts/dmg-layout.swift Resources/dmg-background.png           # human-readable layout
-swift scripts/make-dmg-background.swift --source Resources/dmg-background.png \
-    --layout build/dmg-layout.json --out build/dmg-background.png --limit 256
-swift scripts/dmg-layout.swift build/dmg-background@2x.png            # re-measure the scaled pair
+swift scripts/make-dmg-artwork.swift --source Resources/dmg-background.png \
+    --out build/dmg-background.png --layout-out build/dmg-layout.json --json
 scripts/package.sh --force                                            # rebuild while the DMG is mounted
 ```
 
@@ -167,7 +167,8 @@ either — Apple removed it. So a DMG you hand to a friend behaves like this:
 1. They drag NeoDrop into Applications (the DMG includes the `/Applications` drop target).
 2. First launch shows *"Apple could not verify NeoDrop is free of malware."*
 3. They approve it once: **System Settings → Privacy & Security → scroll down → Open Anyway**.
-   The DMG includes a `Read Me First.txt` with exactly this instruction.
+   The window shows a `Read Me First.txt` with exactly this instruction, in the free corner at the
+   top right of the installer artwork.
 
 To skip that step, either:
 
@@ -269,12 +270,12 @@ Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, dele
 Tests/NeoDropCoreTests/  103 tests, including one per safety rule above
 Resources/AppIcon.png    master app-icon artwork, masked by scripts/make-icon.swift
 Resources/MenuBarIcon*.png  menu bar template icon at 1x/2x/3x, plus the .svg master
-Resources/dmg-background.png  installer window artwork, as supplied (the master)
+Resources/dmg-background.png  installer window wallpaper, as supplied (the master)
 scripts/                 build, icon generation, packaging, verification, e2e, fake NAS
   make-icon.swift        app icon: masking, all ten sizes, mask + orientation checks
   verify-menubar-icon.swift  menu bar icon: template mask, sizes, centring, ink polarity
-  dmg-layout.swift       measures the installer artwork to place the real icons
-  make-dmg-background.swift  scales the artwork into the 1x/@2x background pair
+  make-dmg-artwork.swift  crops + darkens the wallpaper into the 1x/@2x pair and writes the layout
+  dmg-layout.swift, make-dmg-background.swift  the earlier measuring pipeline, now unused
   make-dmg.py            builds the drag-and-drop DMG and verifies the written layout
   setup-dmg-tools.sh     installs dmgbuild into .venv (optional, for the layout)
 packaging/               Info.plist template, entitlements

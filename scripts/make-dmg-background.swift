@@ -47,6 +47,8 @@ var layoutPath: String?
 var output: String?
 var limit = defaultLimit
 var emitJSON = false
+// Width of the margin either side of the instructions icon, or 0 for no instructions slot at all.
+var noticeMargin = 0
 
 var index = 0
 while index < arguments.count {
@@ -63,6 +65,9 @@ while index < arguments.count {
     case "--limit":
         guard let parsed = Int(value()) else { die("--limit needs a number") }
         limit = parsed
+    case "--notice-band":
+        guard let parsed = Int(value()), parsed > 0 else { die("--notice-band needs a margin in points") }
+        noticeMargin = parsed
     case "--json": emitJSON = true
     default: die("unknown option \(argument)")
     }
@@ -110,16 +115,73 @@ let headroom = 3
 let targetNominal = limit - headroom
 let reduction = iconSize > targetNominal ? Double(targetNominal) / Double(iconSize) : 1.0
 
+// What the artwork will imply once it is measured again, estimated from the painted tile rather than
+// from the nominal size, so the icon body ratio is not applied twice.
+let bodyRatio = (layout["iconBodyRatio"] as? Double) ?? (824.0 / 1024.0)
+let paintedIconSize = (layout["paintedIconSize"] as? Int) ?? Int((Double(iconSize) * bodyRatio))
+let scaledPaintedTile = Double(paintedIconSize) * reduction
+let impliedIconSize = Int((scaledPaintedTile / bodyRatio).rounded(.up)) + (iconSize - Int((Double(paintedIconSize) / bodyRatio).rounded(.up)))
+
+// The instructions file is shown in the window, and the art paints icons across its whole width, so
+// there is nowhere inside it for a third icon box. Instead a band is added beside the art, wide
+// enough for the icon Finder will draw there plus a margin either side. That is also what keeps every
+// icon's box inside the content area: an icon hanging outside it makes Finder re-lay-out the window,
+// which moves all of them (measured on macOS 26: ~92pt down, on both axes).
+let noticeBandPoints = noticeMargin > 0 ? impliedIconSize + 2 * noticeMargin : 0
+// The band is added after the art has been resized, at the final resolution, so the art sits on whole
+// pixels of the 2x image. Composing first and resampling after leaves the art half a pixel out, which
+// softens its own glow — and the layout measurement reads that glow against a fixed threshold, so
+// half a pixel of blur is the difference between measuring the painted tile and measuring its halo.
+let noticeBandPixels = noticeMargin > 0 ? even(Double(noticeBandPoints) * 2) : 0
+
 // Even dimensions so the 1x is exactly half the 2x and tiffutil's `-cathidpicheck` holds.
 func even(_ value: Double) -> Int {
     let rounded = Int(value.rounded())
     return rounded % 2 == 0 ? rounded : rounded + 1
 }
 
-let twoXWidth = even(Double(artWidth) * reduction)
-let twoXHeight = even(Double(artHeight) * reduction)
+/// Add a band beside the art, built from the art's own edge: each row of the band takes that row's
+/// edge colour so there is no seam, fading slightly towards the outer edge so it reads as depth
+/// rather than a smear. The band is plain background by construction, which is what lets the
+/// instructions icon sit on it.
+func withLeftBand(_ image: CGImage, width bandWidth: Int) -> CGImage? {
+    guard bandWidth > 0 else { return image }
+    let w = image.width + bandWidth, h = image.height
+    guard let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(x: bandWidth, y: 0, width: image.width, height: h))
+    guard let raw = context.data else { return nil }
+    // Core Graphics pads each row when asked to choose the stride itself, so writing w*4 apart lands
+    // the fill a few pixels out on every row. Use the stride it actually chose.
+    let stride = context.bytesPerRow
+    let bytes = raw.bindMemory(to: UInt8.self, capacity: stride * h)
+    for y in 0..<h {
+        let row = y * stride
+        let edge = row + bandWidth * 4
+        let (r, g, b) = (Double(bytes[edge]), Double(bytes[edge + 1]), Double(bytes[edge + 2]))
+        for x in 0..<bandWidth {
+            let fade = 0.80 + 0.20 * (Double(x) / Double(bandWidth))
+            let out = row + x * 4
+            bytes[out] = UInt8(max(0, min(255, (r * fade).rounded())))
+            bytes[out + 1] = UInt8(max(0, min(255, (g * fade).rounded())))
+            bytes[out + 2] = UInt8(max(0, min(255, (b * fade).rounded())))
+            bytes[out + 3] = 255
+        }
+    }
+    return context.makeImage()
+}
+
+// The band is part of the canvas, so the window grows by it while the art keeps the size it has.
+let artTwoXWidth = even(Double(artWidth) * reduction)
+let artTwoXHeight = even(Double(artHeight) * reduction)
+let twoXWidth = artTwoXWidth + noticeBandPixels
+let twoXHeight = artTwoXHeight
 let oneXWidth = twoXWidth / 2
 let oneXHeight = twoXHeight / 2
+// The band as it lands on screen: this is the width the layout tool is told to expect.
+let noticeBandPointsWritten = Double(noticeBandPixels) / 2
 
 func resized(_ image: CGImage, width: Int, height: Int) -> CGImage? {
     guard let context = CGContext(
@@ -150,17 +212,20 @@ func write(_ image: CGImage, to path: String) -> Bool {
     return CGImageDestinationFinalize(destination)
 }
 
-guard let twoX = resized(image, width: twoXWidth, height: twoXHeight) else {
+guard let artTwoX = resized(image, width: artTwoXWidth, height: artTwoXHeight) else {
     die("could not resample the artwork")
 }
-guard let oneX = resized(twoX, width: oneXWidth, height: oneXHeight) else {
+guard let composed = withLeftBand(artTwoX, width: noticeBandPixels) else {
+    die("could not compose the background")
+}
+guard let oneX = resized(composed, width: oneXWidth, height: oneXHeight) else {
     die("could not resample the 1x background")
 }
 
-// The @2x is written from the master and the 1x from the @2x, so the two are a true pair rather than
-// two independent resamplings of the master that could disagree by a pixel on an odd edge.
+// The @2x is written from the resized art plus its band, and the 1x from the @2x, so the two are a
+// true pair rather than two independent resamplings that could disagree by a pixel on an odd edge.
 let twoXPath = (outPath as NSString).deletingPathExtension + "@2x." + (outPath as NSString).pathExtension
-guard write(twoX, to: twoXPath) else { die("could not write \(twoXPath)") }
+guard write(composed, to: twoXPath) else { die("could not write \(twoXPath)") }
 guard write(oneX, to: outPath) else { die("could not write \(outPath)") }
 
 // Verify what was actually written rather than what was intended.
@@ -180,18 +245,12 @@ guard written2x.0 == written1x.0 * 2, written2x.1 == written1x.1 * 2 else {
     die("the two backgrounds are not a 1x/@2x pair: \(written1x) vs \(written2x)")
 }
 
-// What the artwork will imply once it is measured again, estimated from the painted tile rather than
-// from the nominal size, so the icon body ratio is not applied twice.
-let bodyRatio = (layout["iconBodyRatio"] as? Double) ?? (824.0 / 1024.0)
-let paintedIconSize = (layout["paintedIconSize"] as? Int) ?? Int((Double(iconSize) * bodyRatio))
-let scaledPaintedTile = Double(paintedIconSize) * reduction
-let impliedIconSize = Int((scaledPaintedTile / bodyRatio).rounded(.up)) + (iconSize - Int((Double(paintedIconSize) / bodyRatio).rounded(.up)))
-
 let summary: [String: Any] = [
     "source": sourcePath,
     "oneX": ["path": outPath, "width": written1x.0, "height": written1x.1],
     "twoX": ["path": twoXPath, "width": written2x.0, "height": written2x.1],
     "window": ["width": written1x.0, "height": written1x.1],
+    "noticeBand": Int(noticeBandPointsWritten),
     "reduction": reduction,
     "impliedIconSize": impliedIconSize,
     "limit": limit,
@@ -207,6 +266,10 @@ if emitJSON {
     print("background:   \(written1x.0)x\(written1x.1) points  (\(twoXWidth)x\(twoXHeight) at 2x)")
     print("scale:        \(percent)% of the master")
     print("icon size:    \(impliedIconSize) points implied by the painted icons (limit \(limit))")
+    if noticeBandPointsWritten > 0 {
+        print("notice band:  \(Int(noticeBandPointsWritten)) points added beside the art for the instructions icon")
+        print("              left of the art, so the art keeps its own position on screen")
+    }
 }
 
 guard impliedIconSize <= limit else {
