@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Entitlements for NeoDropFinder.appex: the App Sandbox, and nothing else.
+
+     The App Sandbox is not a choice here. PlugInKit refuses to register an extension without it — the
+     refusal is a line in the system log ("plug-ins must be sandboxed") and nothing else: `pluginkit -m
+     -p com.apple.FinderSync` simply never lists it, and Finder shows no badges and no error. That is
+     what a sandboxed extension buys and what it costs:
+
+       * the extension can read nothing outside its own container;
+       * the app publishes the badge index into that container from outside, which is the only channel
+         the two processes need, and is why no App Group is declared here either — see
+         packaging/entitlements.plist for the measurements behind that decision.
+
+     Deliberately absent: any file access. The extension never opens the user's files — Finder hands it
+     URLs and the index hands it badge identifiers, and both are just strings — so it needs no
+     user-selected, home-relative or network entitlement, and adding one would widen what a compromised
+     extension could reach for no benefit. scripts/verify.sh checks that the sandbox is declared and
+     that an App Group has not been added back: it cannot work from a non-sandboxed app. -->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.app-sandbox</key>
+  <true/>
+</dict>
+</plist>

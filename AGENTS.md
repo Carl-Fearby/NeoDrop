@@ -15,13 +15,15 @@ server and no cloud component.
 
 ```bash
 swift build                                        # compile everything
-swift test                                         # 146 engine tests, must stay green
+swift test                                         # 187 engine tests, must stay green
 swift run NeoDrop                                  # run the app (menu bar icon)
 swift build -c release --show-bin-path             # locate the release binary
 scripts/package.sh [--arch universal] [--no-dmg]   # .app + DMG, ad-hoc signed by default
 scripts/verify.sh --smoke                          # bundle, signature, DMG and a real launch
 scripts/e2e.sh [--keep]                            # drive the packaged app against fake NAS folders
 scripts/e2e-vault.sh [--keep]                      # two real installs, one vault: both directions
+scripts/install.sh [--app path] [--no-enable]      # into /Applications + enable the Finder extension
+scripts/reset.sh [--yes] [--trash] [--app]         # clean-install: state only, dry run by default
 scripts/fake-nas.sh create 3 | destroy | list      # real mounted volumes to test against
 swift scripts/make-icon.swift build/NeoDrop.icns --source Resources/AppIcon.png --verify
 swift scripts/verify-menubar-icon.swift                        # menu bar template icon checks
@@ -128,11 +130,66 @@ Things that are easy to get wrong and are therefore deliberate:
 * **No `pruneEmptyDirectories` on the local side.** On a replica an empty directory is leftovers; a
   person's working copy is not NeoDrop's to tidy.
 
-## The deleted-files web view
+## The first-run wizard (`SetupWizard.swift`)
 
-The “Deleted Files…” menu item opens a `WKWebView` onto a loopback HTTP server in `NeoDropCore`
-(`WebUIServer.swift` serves, `WebUIPage.swift` is the single self-contained page). It is deliberately
-small, and the parts that make it safe are not decoration:
+A pristine configuration — no sources, no replicas, no vaults — is a fresh install or a cleared
+state directory, and the app used to meet it with an empty Settings window whose tabs each assumed
+you already knew what a source, a destination and a vault were. The wizard asks the one question a
+person can answer (which folder matters most) and then how it should be protected, so the two modes
+are explained rather than discovered.
+
+Two rules keep it from becoming a nuisance or a liar:
+
+* **It is offered once.** `AppConfig.didOfferSetup` is set the moment it is shown, so somebody who
+  deliberately closes it is not asked again on every launch; “Set Up NeoDrop…” in the menu brings it
+  back. Without that flag a pristine-but-intentional configuration would be nagged on every start.
+* **It configures through the model**, not by writing `config.json`: `addVault`, `addSource`,
+  `addReplica` and `setMachineName` are the same calls the Settings tabs make, so the wizard cannot
+  create a combination the rest of the app would refuse. When the model refuses one it says why
+  through `banner`, and the wizard shows that instead of closing on a setup that did not happen.
+
+## File status, and the Finder helper
+
+`FileStatus.swift` answers the question a person actually has about a file: *is this safe?* It
+names every place the file exists — each source, this Mac's half of each two-way folder, each
+destination, the shared copy in each vault, and anything a trash or a vault is retaining — plus the
+record NeoDrop has for each copy (source index, manifest, journal, deletion) and the vault's history
+for the path, newest first.
+
+**It never hashes the file.** That is a decision, not an omission: the menu item and the Finder
+service run on whatever the user selected, including a multi-gigabyte video, and re-reading it would
+turn a click into a wait. So a copy is reported as matching when its size and date agree with what
+was recorded, and the report says exactly that — "run Verify & Repair to check the bytes" — rather
+than implying a digest check. If a *faster* answer is ever wanted, cache a digest; do not weaken the
+wording. `testLargeFilesAreNotHashedToAnswerTheQuestion` holds the cost as a property: asking about
+an 8 MB file must not cost more than asking about a small one.
+
+The two UI surfaces are the **File Status…** menu item (asks which file) and the Finder service
+(gets the selection), and both open the same page over the same loopback server:
+
+```
+Finder → right-click → Services → “Show NeoDrop Status”
+        ↳ AppDelegate.showFileStatus(_:userData:error:)   the selector, named in packaging/Info.plist.in
+        ↳ AppModel.fileStatus(path:) → FileStatusQuery    reads manifests, index, records, journals
+        ↳ /<token>/status?path=…  → WebUIPage.statusHTML   one document, every value escaped
+```
+
+The plist and the selector only work as a pair, and `scripts/verify.sh` checks both halves — a
+service naming a selector nobody implements is a menu item that silently does nothing. Two details
+worth keeping:
+
+* `NSServices` accepts `public.item`, so the service also appears for files outside NeoDrop's folders.
+  That is deliberate: "not in any NeoDrop folder" is a useful answer, and a service that vanishes for
+  the wrong selection teaches people it is broken.
+* The status page is rendered on the server rather than fetched by script (unlike the deleted-files
+  page, which acts on the user's behalf). There is nothing to act on, so there is no `fetch` and no
+  script — and everything it prints is user data, so `WebUIPage.escape` is not optional.
+
+## The web views (deleted files, file status)
+
+The “Deleted Files…” and “File Status…” windows open a `WKWebView` onto a loopback HTTP server in
+`NeoDropCore` (`WebUIServer.swift` serves, `WebUIPage.swift` holds both self-contained documents).
+It is deliberately small, and the parts that make it safe are not decoration:
 
 * it binds `127.0.0.1` only, on a port the OS picks;
 * every route sits behind a random per-launch token in the path, and a request without it gets a
@@ -140,10 +197,16 @@ small, and the parts that make it safe are not decoration:
 * the `Host` header must name a loopback host, and a `POST` carrying a foreign `Origin` is refused;
 * the page makes no external requests, so its CSP allows nothing but its own inline style and script.
 
-The engine owns the data (`listDeletions`, `restore`, `purgeExpiredDeletions`); the server only
-formats it. Config reaches the handlers through `AppModel`, because the engine must never re-read
-`config.json`. The app logs the page URL on startup (`Deleted files view ready at …`), which is how
-`scripts/e2e.sh` drives it.
+The engine owns the data (`listDeletions`, `restore`, `purgeExpiredDeletions`, and the read-only
+`FileStatusQuery`); the server only formats it. Config reaches the handlers through `AppModel`,
+because the engine must never re-read `config.json`. The app logs the page URL on startup
+(`Deleted files view ready at …`), which is how `scripts/e2e.sh` drives it. The status route is
+optional in the initialiser so the deleted-files half can be built and tested on its own, and it
+answers 404 until a handler is supplied.
+
+One subtlety in the query string: `HTTPRequest.query` does **not** decode `+` as a space, unlike a
+form submission. A file name may contain a literal `+`, and form-style decoding would silently
+answer about a different file. Spaces arrive percent-encoded, which is what the app sends.
 
 ## The icon
 
@@ -185,6 +248,95 @@ instead. Adding a badge would mean knocking a transparent gap around it.
 
 Without the PNGs in the bundle — `swift run`, or a packaging slip — `MenuController` falls back to
 an SF Symbol so the menu bar is never empty, and logs that it did.
+
+## The Finder badges (`Sources/NeoDropFinder`, `Sources/NeoDropShared`)
+
+The icons next to a file's date come from a **Finder Sync extension** (`com.apple.FinderSync`), not
+from a menu item and not from the FileProvider framework. Finder Sync is the right tool because
+NeoDrop's files are always fully local — there is no online-only state to report, which is what
+FileProvider decorations are for — while a badge is exactly "does this look right?".
+
+Four separate things had to be true before Finder showed anything, and every one of them fails
+silently: `pluginkit -m -p com.apple.FinderSync` simply does not list the extension and no error is
+logged anywhere obvious. They are worth knowing before touching `scripts/package.sh`:
+
+1. **The bundle** needs `CFBundlePackageType XPC!`, `NSExtension` with the FinderSync extension
+   point and a principal class, and the three platform keys an Xcode-built appex always carries
+   (`CFBundleSupportedPlatforms`, `DTPlatformName`, `DTSDKName`). See
+   `packaging/FinderExtension-Info.plist.in`.
+2. **The executable must be a Mach-O `MH_EXECUTE` linked with `NSExtensionMain`** — what Xcode
+   produces. `swiftc -emit-library` (a dylib) and `ld -bundle` are both ignored by PlugInKit, and
+   neither can carry entitlements in its signature: parsing the superblob of an MH_BUNDLE signed
+   ad-hoc *or* with an Apple Development certificate shows only CodeDirectory and Requirements,
+   while an MH_EXECUTE gets the Entitlements and DEREntitlements blobs. Dropbox's own Finder
+   extension (`…/garcon.appex/Contents/MacOS/garcon`) is an MH_EXECUTE with `LC_MAIN` for the same
+   reason. `scripts/verify.sh` asserts the shape, because a regression here is invisible.
+3. **The extension must be sandboxed.** PlugInKit refuses one that is not ("plug-ins must be
+   sandboxed", in the system log only). It therefore also has to live in `/Applications` — PlugInKit
+   only considers extensions of an app it finds in a standard location — which is what
+   `scripts/install.sh` is for, and what makes `build/NeoDrop.app` alone insufficient for testing
+   badges by hand.
+4. **The badge index has to reach it**, and this is the part that had to be measured. It is published
+   into the extension's *own container*, and an App Group cannot do the job: `~/Library/Group
+   Containers` is closed to the unsandboxed app (EPERM writing into one, with an ad-hoc signature and
+   with an Apple Development certificate alike — "You don't have permission to save the file … in the
+   folder group.…"), and a sandboxed process is refused too when the container was created by another
+   bundle. A container's own `Data` directory is an ordinary directory owned by the user, so the app
+   writes it from outside and the sandboxed extension reads it as its home. `FinderStatusIndex`
+   spells both sides out (`extensionIndexURL` for the extension, `extensionContainerIndexURL` for the
+   app), a unit test holds them together, `scripts/verify.sh` refuses an App Group in either
+   entitlement file and checks the app names the container of the extension it ships, and
+   `scripts/e2e.sh` asserts the packaged app actually publishes there.
+
+Inside, everything is a lookup: `FinderStatusIndex` is a small JSON file of *exceptions* — paths
+whose badge is not "in sync" — plus the roots NeoDrop protects. `requestBadgeIdentifier` answers
+from a dictionary, so Finder's scroll path never walks a tree or hashes anything, and a library of a
+million files costs the same as an empty one. The extension never opens a user's file at all; Finder
+hands it URLs and the index hands it badge identifiers.
+
+`NEODROP_HOME` is deliberately **not** honoured: the extension is registered once for the installed
+app, and a scratch installation is not what the Finder showing the user's files should be about.
+
+### Status: the badges work, the channel does not survive an app update
+
+**Known limitation, measured on macOS 26 after the badges were working end to end.** The app
+publishes the index into the extension's own container because that is the only path a sandboxed
+extension can read — and macOS *seals* that container once it has claimed it for the registered
+appex. Writing into it then fails with EPERM ("You don't have permission to save the file … in the
+folder NeoDrop") and the badges die silently. The seal tracks the appex identity, not the running
+process: it appeared when `install.sh` replaced the bundle, and it is still there with the extension
+quit.
+
+What a sandboxed extension can read, measured by logging from inside the extension itself:
+
+| Path | Read |
+| --- | --- |
+| its own container | ✅ |
+| `/tmp/…` | ❌ |
+| `/Users/Shared/…` | ❌ |
+| the app's `~/Library/Application Support/NeoDrop/` | ❌ |
+| **a file inside the very folder it monitors** | ❌ |
+| `~/Library/Group Containers/<group>` (as the unsandboxed app) | ❌ EPERM |
+
+It also does not receive a distributed notification posted by an unsandboxed process (measured:
+observer installed, notification posted, nothing delivered). So there is currently **no** file-based
+channel from the app to a Finder Sync extension: the extension must be sandboxed, the app cannot be
+(that is its whole job), and every readable location is either sealed or denied.
+
+`FinderStatusTests.testPublishingCreatesTheContainerDirectoryWhenTheExtensionHasNeverRun` is
+therefore **left failing on purpose**. It is the marker for this, it is honest about the platform,
+and it must not be weakened, skipped or deleted to make the suite green — the fix is a channel that
+can work, not a quieter assertion. The candidates, in order of promise:
+
+1. **An XPC Mach service.** The app registers `NSXPCListener(machServiceName:)` and the extension
+   connects with `com.apple.security.temporary-exception.mach-lookup.global-name`. No shared file at
+   all, and live updates; badges would need the app running, which for a menu bar app is the normal
+   case.
+2. **A sandboxed app.** With the app sandboxed too, a team-signed App Group works properly — but the
+   app would then need user-selected bookmarks for every share, which changes the product.
+3. Anything that ships the index to the extension outside the sandbox, once one of the above is
+   proven. Do not resurrect the container-write path: it works on a fresh install and dies at the
+   first update, which is the worst way for it to fail.
 
 ## The installer DMG
 
@@ -282,6 +434,13 @@ Two things to know when writing these tests:
   `NEODROP_HOME` state directories) against one vault, so what it proves is the product, not the
   library. It uses the SwiftPM binary rather than the packaged `.app` because LaunchServices will not
   start a second copy of the same bundle — and two machines is the point.
+
+`scripts/reset.sh` is the clean-install path and is a dry run unless given `--yes`. It removes the
+state directory, the preferences plist and the saved application state — and, with `NEODROP_HOME`
+set, only that installation's state directory, never the real one's preferences. It lists the
+folders in `config.json` as *not touched* before it does anything, and `--trash` moves the state to
+the Trash so a reset made by mistake can be undone. Any change that would let it delete a user's
+folder, or the vault's `.neodrop/` on a share, is a bug: the vault belongs to every machine.
 
 `XCTUnwrap` takes an autoclosure and cannot contain `await`; use the local `unwrap(_:)` helper for
 async engine calls.

@@ -362,6 +362,21 @@ enum Panels {
         }
     }
 
+    /// Pick one file or folder, for the “File Status…” menu item when the question did not come
+    /// from a Finder selection.
+    static func chooseFileForStatus(completion: @escaping (String?) -> Void) {
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Show Status"
+        panel.message = "Choose a file or folder to see where NeoDrop keeps it, and what it recorded."
+        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+        completion(panel.runModal() == .OK ? panel.url?.path : nil)
+    }
+
     static func askForShareURL(completion: @escaping (String?) -> Void) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()

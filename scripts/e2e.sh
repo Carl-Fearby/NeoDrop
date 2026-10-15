@@ -46,12 +46,23 @@ STATE="$WORK/state"
 SOURCE="$WORK/Source"
 NAS1="$WORK/NAS1/NeoDrop"
 NAS2="$WORK/NAS2/NeoDrop"
+# Where the Finder extension reads the badge index: the extension is sandboxed, so the app publishes
+# into the container the sandbox gives it. Spelled out here rather than read from the app so that a
+# build naming a different container is caught rather than agreed with.
+BADGE_INDEX="$HOME/Library/Containers/ai.storyteller.neodrop.finder/Data/Library/Application Support/NeoDrop/finder-status.json"
 
 cleanup() {
   if [ -n "${PID:-}" ] && kill -0 "$PID" 2>/dev/null; then
     kill "$PID" 2>/dev/null
     wait "$PID" 2>/dev/null
   fi
+  # The app publishes its badge index to wherever the *installed* Finder extension reads it, not to
+  # the scratch state directory (it cannot: the extension is sandboxed and its container is the only
+  # place both processes can reach). This test therefore writes into that container, and removes what
+  # it wrote — a test run must not leave the user's Finder badging a temporary folder. A real
+  # installation republishes on its next refresh, so the worst case is badges going quiet briefly.
+  rm -f "$BADGE_INDEX" 2>/dev/null
+  rm -f "$STATE"/finder-status.json 2>/dev/null
   if [ "$KEEP" -eq 0 ]; then rm -rf "$WORK"; else printf 'kept: %s\n' "$WORK"; fi
 }
 trap cleanup EXIT
@@ -150,6 +161,28 @@ if grep -q "Menu bar status item installed (icon: bundled artwork" "$STATE/neodr
   fi
 else
   fail "the app fell back to a system symbol: $(grep 'Menu bar status item installed' "$STATE/neodrop.log" | tail -1)"
+fi
+
+# ---- the Finder badges --------------------------------------------------------------------------
+# The badges are the only part of the app a user sees without opening it, and the chain has three
+# links that fail silently on their own: the app has to publish the index, it has to land where the
+# sandboxed extension can read it, and it has to name the folders it is protecting. A green tick that
+# is never drawn looks exactly like a file nobody asked about.
+if grep -q "Finder badges updated" "$STATE/neodrop.log" 2>/dev/null; then
+  pass "the app published what Finder should badge"
+else
+  fail "the app never published a badge index"
+fi
+
+if [ -f "$BADGE_INDEX" ]; then
+  pass "the badge index reached the container the Finder extension reads"
+  if grep -q "$SOURCE" "$BADGE_INDEX" 2>/dev/null; then
+    pass "the index names the folder it protects"
+  else
+    fail "the published index does not mention $SOURCE"
+  fi
+else
+  fail "no badge index at $BADGE_INDEX: the extension would draw nothing"
 fi
 
 # ---- what landed on the shares -----------------------------------------------------------------

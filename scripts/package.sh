@@ -157,6 +157,74 @@ else
   info "menu bar icon: none in Resources/, so the app falls back to a system symbol"
 fi
 
+# ---- Finder extension -------------------------------------------------------------------------
+# A Finder Sync extension is a bundle with a principal class and an NSExtension dictionary, which
+# SwiftPM has no product type for, so it is compiled here with swiftc. It is compiled together with
+# the one shared file it needs — the badge index format — rather than linked against NeoDropCore: the
+# extension must keep working while the app is not running, so the less it shares at load time, the
+# better. It has to be signed before the app that embeds it (see the signing step below), because
+# signing the outer bundle does not reach nested code.
+FINDER_EXTENSION="NeoDropFinder"
+APPEX="$APP/Contents/PlugIns/$FINDER_EXTENSION.appex"
+echo "Building the Finder extension…"
+mkdir -p "$APPEX/Contents/MacOS"
+EXT_TMP="$BUILD/finder-extension"
+rm -rf "$EXT_TMP"
+mkdir -p "$EXT_TMP"
+EXT_SOURCES=("$ROOT/Sources/NeoDropFinder/SyncExtension.swift"
+             "$ROOT/Sources/NeoDropShared/FinderStatus.swift")
+
+build_extension_arch() {
+  local arch="$1" out="$2" objects="$EXT_TMP/objects-$1"
+  mkdir -p "$objects"
+  # Compiled then linked by hand, and linked as a *executable* with `NSExtensionMain` as its entry
+  # point — which is what Xcode produces for an app extension, and the only shape that works here.
+  #
+  # The alternatives were all tried and all fail in ways worth writing down, because each costs an
+  # afternoon to rediscover:
+  #
+  #   * `swiftc -emit-library` (a dylib): PlugInKit never registers it, and the only diagnosis is a
+  #     line in the system log — "plug-ins must be sandboxed" — because a dylib signature cannot carry
+  #     the App Sandbox entitlement either;
+  #   * `ld -bundle` (a real MH_BUNDLE): still no entitlement blob in the signature. Verified by
+  #     parsing the superblob: an MH_BUNDLE signed ad-hoc *or* with an Apple Development certificate
+  #     ends up with only CodeDirectory and Requirements. An MH_EXECUTE gets the Entitlements and
+  #     DEREntitlements blobs. Dropbox's own Finder extension (…/garcon.appex/Contents/MacOS/garcon)
+  #     is an MH_EXECUTE with LC_MAIN for exactly this reason.
+  #
+  # `ld` alone knows nothing about the Swift runtime, so it is handed the SDK and the runtime library
+  # path; LC_LINKER_OPTION in the object files pulls in the rest.
+  ( cd "$objects" && xcrun swiftc -O -parse-as-library -c \
+      -module-name "$FINDER_EXTENSION" \
+      -target "$arch-apple-macos$MIN_OS" \
+      "${EXT_SOURCES[@]}" )
+  xcrun ld -o "$out" "$objects"/*.o \
+    -e _NSExtensionMain \
+    -syslibroot "$(xcrun --show-sdk-path)" \
+    -platform_version macos "$MIN_OS" "$MIN_OS" \
+    -L/usr/lib/swift \
+    -framework AppKit -framework FinderSync -framework Foundation -lSystem
+}
+
+if [ -n "$LIPO_TARGET" ]; then
+  for ARCH_NAME in $LIPO_TARGET; do
+    build_extension_arch "$ARCH_NAME" "$EXT_TMP/$ARCH_NAME"
+  done
+  lipo -create -output "$APPEX/Contents/MacOS/$FINDER_EXTENSION" "$EXT_TMP"/arm64 "$EXT_TMP"/x86_64
+else
+  build_extension_arch "$ARCH_LABEL" "$APPEX/Contents/MacOS/$FINDER_EXTENSION"
+fi
+chmod +x "$APPEX/Contents/MacOS/$FINDER_EXTENSION"
+rm -rf "$EXT_TMP"
+
+sed -e "s/@VERSION@/$VERSION/g" \
+    -e "s/@SHORT_VERSION@/$SHORT_VERSION/g" \
+    -e "s/@BUILD_SHA@/$BUILD_SHA/g" \
+    -e "s/@MIN_OS@/$MIN_OS/g" \
+    "$HERE/FinderExtension-Info.plist.in" > "$APPEX/Contents/Info.plist"
+plutil -lint "$APPEX/Contents/Info.plist" >/dev/null
+info "Finder extension: $APPEX ($ARCH_LABEL)"
+
 # ---- entitlements sanity ----------------------------------------------------------------------
 # A non-empty entitlement file is worth a second look: it means somebody added a capability.
 if grep -q '<key>' "$HERE/entitlements.plist"; then
@@ -171,6 +239,19 @@ if [ -n "${MACOS_KEYCHAIN:-}" ]; then
 fi
 
 echo "Signing with identity: $IDENTITY"
+# Nested code first: the extension is its own bundle and Gatekeeper validates it on its own, because
+# Finder is what loads it. `--force` on the outer bundle would not reach it. It gets its own
+# entitlements file — the App Sandbox, and nothing else — because PlugInKit refuses to register an
+# extension that is not sandboxed. The badge index reaches it through its own container, which the
+# app writes from outside; an App Group cannot do that job and is not declared (see
+# packaging/entitlements.plist).
+codesign --force --options runtime --timestamp=none \
+  --entitlements "$HERE/FinderExtension-entitlements.plist" \
+  --sign "$IDENTITY" \
+  ${KEYCHAIN_ARG[@]+"${KEYCHAIN_ARG[@]}"} \
+  "$APPEX"
+codesign --verify --strict "$APPEX"
+
 codesign --force --options runtime --timestamp=none \
   --entitlements "$HERE/entitlements.plist" \
   --sign "$IDENTITY" \

@@ -7,15 +7,9 @@ import Foundation
 /// through two relative endpoints, so the URL token never appears in the markup and the page keeps
 /// working when the port changes next launch.
 enum WebUIPage {
-    static func html(retentionDays: Int) -> String {
-        """
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Deleted Files — NeoDrop</title>
-        <style>
+    /// The design tokens both pages share, so a colour is decided once. Everything here is inline:
+    /// these pages are loaded by a web view that has no business reaching the network.
+    static let tokens = """
         :root {
           color-scheme: light dark;
           --bg: #f5f5f7;
@@ -44,6 +38,37 @@ enum WebUIPage {
             --good-text: #8ce6a5;
           }
         }
+        """
+
+    /// Everything the page prints is user-visible text — a file name, a path, a machine name, a
+    /// journal line — and none of it is markup. Escaping is the only thing standing between a file
+    /// called `<img onerror=…>` and script execution inside an app-owned window.
+    static func escape(_ text: String) -> String {
+        var out = ""
+        out.reserveCapacity(text.count)
+        for character in text {
+            switch character {
+            case "&": out += "&amp;"
+            case "<": out += "&lt;"
+            case ">": out += "&gt;"
+            case "\"": out += "&quot;"
+            case "'": out += "&#39;"
+            default: out.append(character)
+            }
+        }
+        return out
+    }
+
+    static func html(retentionDays: Int) -> String {
+        """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Deleted Files — NeoDrop</title>
+        <style>
+        \(tokens)
         * { box-sizing: border-box; }
         body {
           margin: 0;
@@ -263,5 +288,126 @@ enum WebUIPage {
         </body>
         </html>
         """
+    }
+
+    /// The file-status page: the answer to "is this file safe?" for one path.
+    ///
+    /// Rendered on the server instead of fetched by script, unlike the deleted-files page: the
+    /// report is already computed when the window opens, there is nothing to act on, and a page
+    /// with no JavaScript has nothing to go wrong. Every value it prints is escaped.
+    static func statusHTML(for report: FileStatusReport) -> String {
+        let rows = report.locations.map { location -> String in
+            var lines = ""
+            if let recorded = location.recorded {
+                var facts = ["recorded by NeoDrop as \(escape(recorded.kind)) on \(date(recorded.at))"]
+                if let verified = recorded.verifiedAt { facts.append("verified \(date(verified))") }
+                if let machine = recorded.machineName { facts.append("published by \(escape(machine))") }
+                if let expires = recorded.expiresAt { facts.append("recoverable until \(date(expires))") }
+                if recorded.matches {
+                    facts.append("size and date match the record")
+                } else if location.present {
+                    facts.append("does NOT match the record — ask Verify & Repair to check the bytes")
+                }
+                lines = "<div class=\"detail\">\(facts.joined(separator: " · "))</div>"
+            }
+            return """
+                <div class="row">
+                  <div class="info">
+                    <div class="name">\(escape(location.role.label)) — \(escape(location.name))\(location.present ? "" : " <span class=\"missing\">not there now</span>")</div>
+                    <div class="path">\(escape(location.absolutePath))</div>
+                    <div class="detail">\(escape(location.note))</div>
+                    \(lines)
+                  </div>
+                </div>
+                """
+        }.joined()
+
+        let history = report.history.isEmpty
+            ? "<div class=\"row\"><div class=\"info\"><div class=\"detail\">No two-way folder has published a change to this path.</div></div></div>"
+            : report.history.map { entry in
+                """
+                <div class="row">
+                  <div class="info">
+                    <div class="name">\(escape(entry.kind))d by \(escape(entry.machineName))</div>
+                    <div class="detail">\(date(entry.at)) · \(bytes(entry.size)) · \(escape(String(entry.sha256.prefix(12))))…</div>
+                  </div>
+                </div>
+                """
+            }.joined()
+
+        let badge = report.covered ? "" : "<div class=\"banner warn\">Not in any NeoDrop folder.</div>"
+
+        return """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>File Status — NeoDrop</title>
+        <style>
+        \(tokens)
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          padding: 22px 20px 40px;
+          background: var(--bg);
+          color: var(--text);
+          font: 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+        }
+        header, main, .banner, .note { max-width: 720px; margin: 0 auto; }
+        h1 { font-size: 21px; line-height: 1.2; margin: 0 0 4px; letter-spacing: -0.01em; }
+        .path { color: var(--muted); font-size: 12px; word-break: break-all; margin: 0; }
+        .summary { margin: 14px auto 0; padding: 11px 13px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+        .banner { margin: 12px auto 0; border-radius: 9px; padding: 9px 12px; font-size: 12.5px; }
+        .banner.warn { background: var(--warn); color: var(--warn-text); }
+        section { max-width: 720px; margin: 18px auto 0; }
+        h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 6px 2px; }
+        main, .list { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+        .row { padding: 11px 14px; border-top: 1px solid var(--line); }
+        .row:first-child { border-top: 0; }
+        .name { font-weight: 600; }
+        .name .missing { font-weight: 400; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+        .detail { color: var(--muted); font-size: 12px; margin-top: 3px; }
+        .note { margin-top: 16px; color: var(--muted); font-size: 12px; }
+        </style>
+        </head>
+        <body>
+        <header>
+          <h1>File Status</h1>
+          <p class="path">\(escape(report.path))</p>
+        </header>
+        \(badge)
+        <p class="summary">\(escape(report.summary))</p>
+
+        <section>
+          <h2>Where this file is</h2>
+          <main>\(rows.isEmpty ? "<div class=\"row\"><div class=\"info\"><div class=\"detail\">NeoDrop has nothing to say about this path.</div></div></div>" : rows)</main>
+        </section>
+
+        <section>
+          <h2>History in the two-way folders</h2>
+          <div class="list">\(history)</div>
+        </section>
+
+        <p class="note">
+          A copy is counted here when NeoDrop's records and the file system agree. The bytes
+          themselves are checked by Verify &amp; Repair, which is slower because it reads every file.
+        </p>
+        </body>
+        </html>
+        """
+    }
+
+    private static let stamp: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    private static func date(_ value: Date) -> String { stamp.string(from: value) }
+
+    private static func bytes(_ count: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: count, countStyle: .file)
     }
 }

@@ -32,13 +32,45 @@ final class WebUIServerTests: XCTestCase {
         }
     }
 
-    private func start(stub: Stub) async throws -> (WebUIServer, URL) {
+    /// Records what the app was asked about, from the server's own queue.
+    final class AskedPaths: @unchecked Sendable {
+        private let lock = NSLock()
+        private var paths: [String] = []
+        func append(_ path: String) { lock.lock(); paths.append(path); lock.unlock() }
+        var all: [String] { lock.lock(); defer { lock.unlock() }; return paths }
+    }
+
+    private func start(stub: Stub, status: WebUIServer.StatusHandler? = nil) async throws -> (WebUIServer, URL) {
         let server = WebUIServer(
             list: { stub.listEntries() },
-            restore: { path in try stub.restore(path) }
+            restore: { path in try stub.restore(path) },
+            status: status
         )
         let url = try await server.start()
         return (server, url)
+    }
+
+    /// A report with no disk behind it: enough to prove the route is wired and the page is escaped.
+    private func report(path: String, name: String = "NAS1") -> FileStatusReport {
+        FileStatusReport(
+            path: path,
+            relativePath: (path as NSString).lastPathComponent,
+            kind: "file",
+            summary: "It is on this Mac and copied to \(name).",
+            locations: [
+                FileLocation(role: .replica, name: name, rootPath: "/Volumes/NAS1", absolutePath: path,
+                             present: true, size: 1234, modified: Date(),
+                             recorded: RecordedCopy(kind: "manifest", sha256: String(repeating: "b", count: 64),
+                                                    size: 1234, at: Date(), verifiedAt: Date(), matches: true),
+                             note: "A complete copy of what NeoDrop wrote."),
+            ],
+            history: [
+                FileHistoryEntry(at: Date(), kind: "update", machineName: "Anna's MacBook", size: 1234,
+                                 sha256: String(repeating: "c", count: 64)),
+            ],
+            generatedAt: Date(),
+            covered: true
+        )
     }
 
     /// The wire shape of the two responses, decoded here rather than through the server's own
@@ -179,6 +211,91 @@ final class WebUIServerTests: XCTestCase {
         let (_, response) = try await URLSession.shared.data(for: request)
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 400)
         XCTAssertTrue(stub.restored().isEmpty, "nothing is restored without a path")
+    }
+
+    // MARK: - File status
+
+    func testStatusRouteRendersTheReportForTheDecodedPath() async throws {
+        let asked = "file:///tmp/Anna's Folder/alpha.txt"
+        let path = "/tmp/Anna's Folder/alpha.txt"
+        let stub = Stub()
+        let askedPaths = AskedPaths()
+        let expected = report(path: path)
+        let (server, url) = try await start(stub: stub, status: { requested in
+            askedPaths.append(requested)
+            return requested == path ? expected : nil
+        })
+        defer { server.stop() }
+
+        var components = URLComponents(url: url.appendingPathComponent("status"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        let request = try XCTUnwrap(components?.url)
+
+        let (data, response) = try await URLSession.shared.data(from: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 200)
+        XCTAssertEqual(http.value(forHTTPHeaderField: "Content-Type"), "text/html; charset=utf-8")
+        XCTAssertEqual(askedPaths.all, [path], "the query arrives percent-decoded as a real path: \(askedPaths.all)")
+
+        let html = String(decoding: data, as: UTF8.self)
+        XCTAssertTrue(html.contains("File Status"))
+        XCTAssertTrue(html.contains("A complete copy of what NeoDrop wrote."))
+        XCTAssertTrue(html.contains("Anna&#39;s MacBook") || html.contains("Anna's MacBook"),
+                      "the publishing machine is named")
+        XCTAssertNotEqual(asked, path)
+    }
+
+    /// The page is a document built from user data — a file name, a path, a machine name — so it is
+    /// the one place in the app where a hostile file name could become markup.
+    func testStatusPageEscapesEverythingItPrints() async throws {
+        let path = "/tmp/<img src=x onerror=alert(1)>.txt"
+        let stub = Stub()
+        let expected = report(path: path)
+        let (server, url) = try await start(stub: stub, status: { _ in expected })
+        defer { server.stop() }
+
+        var components = URLComponents(url: url.appendingPathComponent("status"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        let (data, response) = try await URLSession.shared.data(from: try XCTUnwrap(components?.url))
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        let html = String(decoding: data, as: UTF8.self)
+
+        XCTAssertFalse(html.contains("<img src=x"), "markup in a path must not reach the document")
+        XCTAssertTrue(html.contains("&lt;img src=x"), html)
+    }
+
+    func testStatusRouteRefusesARelativePath() async throws {
+        let stub = Stub()
+        let askedPaths = AskedPaths()
+        let (server, url) = try await start(stub: stub, status: { path in
+            askedPaths.append(path)
+            return FileStatusReport(path: path, relativePath: path, kind: "file", summary: "asked",
+                                    locations: [], history: [], generatedAt: Date(), covered: false)
+        })
+        defer { server.stop() }
+
+        var components = URLComponents(url: url.appendingPathComponent("status"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: "relative/alpha.txt")]
+        let (_, response) = try await URLSession.shared.data(from: try XCTUnwrap(components?.url))
+
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 400)
+        XCTAssertTrue(askedPaths.all.isEmpty, "a path that is not absolute never reaches the app")
+    }
+
+    func testStatusRouteIsAbsentWhenTheAppCannotAnswer() async throws {
+        let (server, url) = try await start(stub: Stub())
+        defer { server.stop() }
+
+        let (_, response) = try await URLSession.shared.data(from: url.appendingPathComponent("status"))
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 404)
+    }
+
+    func testStatusQueryParsing() {
+        XCTAssertEqual(HTTPRequest.query(of: "/t/status?path=%2Ftmp%2Fa%20b.txt"), ["path": "/tmp/a b.txt"])
+        XCTAssertEqual(HTTPRequest.query(of: "/t/status?path=/tmp/a+b.txt"), ["path": "/tmp/a+b.txt"],
+                       "a literal + is part of a file name, not a space")
+        XCTAssertEqual(HTTPRequest.query(of: "/t/status"), [:])
+        XCTAssertEqual(HTTPRequest.query(of: "/t/status?path=/tmp/a.txt#anchor"), ["path": "/tmp/a.txt"])
     }
 
     func testWrongMethodOnAKnownRouteIsRejected() async throws {

@@ -304,7 +304,17 @@ and says so in its log.
 
 ## Using it
 
-NeoDrop refuses to guess, so it starts with nothing configured.
+The first launch opens **Set Up NeoDrop**, a short wizard that asks the one question everything else
+depends on — which folder matters most — and then how it should be protected: **the same folder on
+every Mac** (a two-way folder pointed at a vault on a share) or **a copy on a NAS** (a one-way
+mirror). It ends by creating exactly that arrangement and syncing once. It introduces itself on a
+fresh install and never nags again: **Set Up NeoDrop…** in the menu brings it back whenever you want
+it, and everything it does can also be done by hand in Settings.
+
+A fresh install means *no state directory*, not a freshly copied app — see
+[Clean install](#clean-install) below.
+
+By hand, the same two kinds of destination:
 
 1. **Settings…** in the menu → **Sources** → *Add Folder…* — pick the folder to protect.
 2. **Destinations** → *Add Destination…* — pick the folder on the mounted NAS. Create a `NeoDrop`
@@ -331,6 +341,55 @@ The menu shows each replica's status, file count, last sync and last verify, plu
 A two-way setup needs no source and no replica: it is a complete configuration on its own, and the
 app will not claim otherwise.
 
+### Is this file safe? — the Finder helper
+
+Select a file or folder in Finder → right-click → **Services** → **Show NeoDrop Status** (give it a
+keyboard shortcut in System Settings → Keyboard → Keyboard Shortcuts → Services). The window that
+opens answers in plain sentences: the verdict, every place the file exists — this Mac, each
+destination, the shared copy in a vault, anything the trash is holding — what NeoDrop recorded for
+each copy, and, for a two-way folder, the history of that path including which Mac published the
+newest version. **File Status…** in the menu does the same for a file you choose, and both open the
+same one-document page served over loopback.
+
+What it does *not* do is read the file: the report stats each copy and compares it with what NeoDrop
+recorded, so it answers instantly for a video of any size. "Size and date match the record" is
+therefore the strongest claim it makes; **Verify & Repair** is what re-hashes the bytes, and the page
+says so rather than implying more.
+
+### At a glance: the badges in Finder
+
+Dropbox-shaped: in Finder, a folder or file NeoDrop protects carries a small icon next to its date,
+so the state is visible without opening anything.
+
+| Icon | Meaning |
+| --- | --- |
+| Green tick | Here, and copied to every destination NeoDrop recorded |
+| Clock | Here, but not everywhere yet — new or edited since the last sync, or a destination was away when it ran (**Sync Now** is the fix) |
+| Spinning arrows | NeoDrop is reading or writing this file right now |
+| Orange triangle | A destination copy is missing or no longer matches the record — run **Verify & Repair** |
+| Trash | Bytes NeoDrop is deliberately holding after a deletion, recoverable from **Deleted Files…** |
+| Question mark | On a destination but not written by NeoDrop: somebody put it there by hand, and NeoDrop will not delete or overwrite it |
+| Dash | Nothing to do with NeoDrop, inside a protected folder but matching an ignore pattern |
+
+A file outside every protected folder gets no icon at all — a badge on everything would say nothing.
+A folder shows the worst of what is inside it, so one file needing attention is visible from the
+folder above. Right-click a file → **Show NeoDrop Status** for the full report (above).
+
+**Known limitation — the badges do not survive an app update yet.** The state reaches the extension
+through a file in its sandbox container, and macOS seals that container once it has claimed it for
+the installed extension, so replacing the app leaves the write failing and the badges quietly gone.
+The measurements, and the two channels that can work (an XPC Mach service from the app, or a
+sandboxed app with a team-signed App Group), are in AGENTS.md — along with the failing test that
+marks it. Everything else here is unaffected: syncing, verifying, restoring and File Status all work
+whether or not the extension can be told about it.
+
+This is a Finder extension, so it has to be switched on once: `scripts/install.sh` does it for you,
+or **System Settings → General → Login Items & Extensions → Finder Extensions → NeoDrop**. The
+badges come from NeoDrop's own records — nothing is hashed and no folder is walked to draw them — so
+they appear the moment the state changes, and they are honest about *when* they last knew something.
+With no folders configured there is nothing to badge, and nothing is drawn: a green tick on no
+evidence is the one lie a badge must not tell.
+
 ### Trying it without a NAS
 
 ```bash
@@ -349,18 +408,22 @@ Sources/NeoDropCore/     engine: scanning, hashing, mirroring, verification, rep
   Vault.swift            vault + machine identity, the append-only journal, path normalisation,
                          retained versions, the local cursor
   VaultSync.swift        the two-way reconciler: publish, apply, seed, adopt, conflicts
-  WebUIServer.swift      loopback HTTP server behind the deleted-files window
-  WebUIPage.swift        the deleted-files page: one self-contained document
+  FileStatus.swift       "is this file safe?": every copy, what was recorded for it, its history
+  WebUIServer.swift      loopback HTTP server behind the deleted-files and file-status windows
+  WebUIPage.swift        both pages: self-contained documents, rendered or fetched over loopback
   Scanner.swift          enumeration, excludes, cached source hashes
   Hashing.swift          streaming SHA-256, durable atomic writes
   Storage.swift          config, manifests, source index, runtime state (JSON)
   Volumes.swift          volume identity, SMB mount requests, boot-volume detection
   ConfigValidator.swift  "this configuration does not actually protect anything" checks
   FolderWatcher.swift    FSEvents with debounce
-Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, deleted-files web view
+Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, the two web views
+  SetupWizard.swift      the first-run wizard: the main folder, then the mode, then the destination
   VaultsTab.swift        the Two-Way settings tab
   VaultStatus.swift      per-folder display state for the menu and Settings
-Tests/NeoDropCoreTests/  146 tests, including one per safety rule above
+Sources/NeoDropShared/   the badge format, shared by the app and the Finder extension
+Sources/NeoDropFinder/   the Finder Sync extension: the badges next to a file's date
+Tests/NeoDropCoreTests/  187 tests, including one per safety rule above
 Resources/AppIcon.png    master app-icon artwork, masked by scripts/make-icon.swift
 Resources/MenuBarIcon*.png  menu bar template icon at 1x/2x/3x, plus the .svg master
 Resources/dmg-background.png  installer window wallpaper, as supplied (the master)
@@ -371,6 +434,8 @@ scripts/                 build, icon generation, packaging, verification, e2e, f
   dmg-layout.swift, make-dmg-background.swift  the earlier measuring pipeline, now unused
   make-dmg.py            builds the drag-and-drop DMG and verifies the written layout
   e2e-vault.sh           two real installs against one vault: both directions, joining, deletions
+  install.sh             copy into /Applications and switch the Finder extension on
+  reset.sh               the clean-install path: removes this Mac's state, never your data
   setup-dmg-tools.sh     installs dmgbuild into .venv (optional, for the layout)
 packaging/               Info.plist template, entitlements
 build/                   generated: NeoDrop.app, .icns, .dmg
@@ -383,6 +448,38 @@ Mac's identity) plus `vaults/<id>.json` (the cursor per vault). Delete that fold
 forgets everything — your data is unaffected, but the retained copies in `.neodrop-trash/` become
 files with no record pointing at them, which is what the delete-first purge order is designed to
 avoid.
+
+### Clean install
+
+Copying a new `NeoDrop.app` over the old one is *not* a clean install: the configuration lives in
+Application Support, not in the bundle, so the app finds the old folders and carries on. "Clean"
+means removing this Mac's state:
+
+```bash
+scripts/reset.sh                # dry run: prints exactly what it would remove, and what it will not touch
+scripts/reset.sh --yes          # carries it out
+scripts/reset.sh --yes --trash  # moves the state to the Trash instead, so it can be undone
+```
+
+The app must be quit first (the script checks and refuses). Three paths go:
+
+| Path | What it holds |
+| --- | --- |
+| `~/Library/Application Support/NeoDrop/` | config, manifests, source index, deletion records, log, machine identity |
+| `~/Library/Preferences/ai.storyteller.neodrop.plist` | the little macOS remembers about the app (window state) |
+| `~/Library/Saved Application State/ai.storyteller.neodrop.savedState` | window restoration state |
+| `~/Library/Containers/ai.storyteller.neodrop.finder/…/NeoDrop/finder-status.json` | the badge index the Finder extension reads — removed so Finder cannot keep badging folders NeoDrop has just forgotten (the container itself is left alone; macOS owns it) |
+
+And two things stay, deliberately: **your folders** — every source, destination and two-way folder
+in `config.json` is listed and left alone — and the **vault's `.neodrop/` on the share**, because its
+journals and retained versions belong to every Mac, not to this one. The copy in `/Applications` is
+removed only with `--app`. Pass `--keep-machine-name` to keep the identity so the others still know
+this Mac by name. With `NEODROP_HOME` set, only that installation is touched.
+
+Afterwards the app starts as a fresh install and the setup wizard offers itself again. Note what it
+costs: each destination then holds files with no local record of them, so the next sync re-hashes and
+writes nothing, but a deletion performed *before* the reset can no longer be restored (the record
+that pointed at the retained copy is gone).
 
 Every piece of per-machine state is local; the only thing shared is the vault itself. That is
 deliberate: two machines must never write the same file, and a machine that copied another's
@@ -397,8 +494,9 @@ Deliberate omissions, roughly in order of value:
 
 * **File history / versioning, in mirror mode.** A deletion is recoverable for 30 days everywhere,
   and a two-way folder keeps the previous contents of anything it overwrites in `.neodrop/versions/`
-  for the same window. A *mirror* still has no versioning at all: the previous contents are gone the
-  moment the new copy lands. A “Versions” browser over those retained blobs is the natural next step.
+  for the same window — File Status shows that history per path. A *mirror* still has no versioning
+  at all: the previous contents are gone the moment the new copy lands. A “Versions” browser over
+  those retained blobs is the natural next step.
 * **Making two-way folders work with a Mac that is asleep or offline for weeks.** Nothing is
   corrupted — the journal is append-only and the cursor is per machine — but a machine that was away
   for a long time does all its catching up in one sync, and a very large vault then means a long

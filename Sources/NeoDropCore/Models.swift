@@ -85,6 +85,10 @@ public struct AppConfig: Codable, Sendable {
     public var allowBulkDeletions: Bool
     /// Glob patterns matched against the file name and the relative path.
     public var excludes: [String]
+    /// Whether the first-run setup wizard has already been offered. It is shown once on a pristine
+    /// install, and afterwards only when asked for from the menu: a window that reappears every
+    /// launch until someone configures something is a nag, not an invitation.
+    public var didOfferSetup: Bool
 
     public init(
         version: Int = 1,
@@ -99,7 +103,8 @@ public struct AppConfig: Codable, Sendable {
         verifyAfterCopy: Bool = true,
         mirrorDeletions: Bool = true,
         allowBulkDeletions: Bool = false,
-        excludes: [String] = AppConfig.defaultExcludes
+        excludes: [String] = AppConfig.defaultExcludes,
+        didOfferSetup: Bool = false
     ) {
         self.version = version
         self.sources = sources
@@ -114,6 +119,7 @@ public struct AppConfig: Codable, Sendable {
         self.mirrorDeletions = mirrorDeletions
         self.allowBulkDeletions = allowBulkDeletions
         self.excludes = excludes
+        self.didOfferSetup = didOfferSetup
     }
 
     public static let defaultExcludes = [".DS_Store", "._*", ".Trash", "*.tmp", "*.part", ".neodrop-*"]
@@ -137,7 +143,12 @@ public struct AppConfig: Codable, Sendable {
         mirrorDeletions = try container.decodeIfPresent(Bool.self, forKey: .mirrorDeletions) ?? true
         allowBulkDeletions = try container.decodeIfPresent(Bool.self, forKey: .allowBulkDeletions) ?? false
         excludes = try container.decodeIfPresent([String].self, forKey: .excludes) ?? AppConfig.defaultExcludes
+        didOfferSetup = try container.decodeIfPresent(Bool.self, forKey: .didOfferSetup) ?? false
     }
+
+    /// Nothing configured at all: a fresh install, or one whose state directory was just removed.
+    /// This is what decides whether the setup wizard introduces itself on launch.
+    public var isPristine: Bool { sources.isEmpty && replicas.isEmpty && vaults.isEmpty }
 
     public var enabledReplicas: [Replica] {
         replicas.filter(\.enabled).sorted { $0.priority < $1.priority }

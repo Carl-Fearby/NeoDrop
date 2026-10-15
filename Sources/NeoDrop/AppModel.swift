@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import NeoDropCore
+import NeoDropShared
 import ServiceManagement
 import UserNotifications
 
@@ -32,6 +33,10 @@ final class AppModel: ObservableObject {
 
     var onOpenSettings: (() -> Void)?
     var onOpenDeletedFiles: (() -> Void)?
+    var onOpenSetup: (() -> Void)?
+    /// Show the status of one file from Finder's Services menu. A nil path asks the user which file;
+    /// that is what the menu item does.
+    var onOpenFileStatus: ((String?) -> Void)?
 
     let paths: StorePaths
     let engine: MirrorEngine
@@ -95,11 +100,24 @@ final class AppModel: ObservableObject {
         scheduleTimer()
         refreshActivity()
         startWebUI()
+        offerSetupIfPristine()
         Task {
             await refresh()
             // A quiet sync on launch closes the gap left by whatever happened while we were off.
             if config.isConfigured { syncNow(reason: "launch") }
         }
+    }
+
+    /// Introduce the wizard on a fresh install, once.
+    ///
+    /// A cleared state directory is a fresh install (see `StorePaths`), so a first run and a reset
+    /// land in the same place: nothing configured, and no idea what the tabs mean. `didOfferSetup`
+    /// is what keeps it to one introduction — somebody who closes the wizard deliberately must not
+    /// be asked again on every launch, and the menu keeps it one click away.
+    private func offerSetupIfPristine() {
+        guard config.isPristine, !config.didOfferSetup else { return }
+        config.didOfferSetup = true
+        onOpenSetup?()
     }
 
     func stop() {
@@ -128,6 +146,9 @@ final class AppModel: ObservableObject {
             restore: { [weak self] relativePath in
                 guard let self else { throw NeoDropError.retainedCopyUnavailable(relativePath) }
                 return try await self.restoreDeletion(relativePath)
+            },
+            status: { [weak self] path in
+                await self?.fileStatus(path: path)
             }
         )
         webServer = server
@@ -142,6 +163,23 @@ final class AppModel: ObservableObject {
                 NeoDropLog.shared.write("Deleted files view unavailable: \(error.localizedDescription)", level: .warning)
             }
         }
+    }
+
+    /// What NeoDrop knows about one path, for the Finder service and the status page.
+    ///
+    /// Reads only: manifests, the source index, delete records and the vault journals, plus a stat.
+    /// Nothing is hashed, so this is safe to answer instantly for a file of any size — see
+    /// `FileStatusQuery`.
+    func fileStatus(path: String) async -> FileStatusReport? {
+        FileStatusQuery(paths: paths, config: config).report(for: URL(fileURLWithPath: path))
+    }
+
+    /// The page that shows one file's status, on the local server.
+    func statusPageURL(for path: String) -> URL? {
+        guard let base = deletedFilesURL else { return nil }
+        var components = URLComponents(url: base.appendingPathComponent("status"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        return components?.url
     }
 
     /// Everything the page lists, straight from the engine's records.
@@ -579,6 +617,30 @@ final class AppModel: ObservableObject {
         snapshots = await engine.inspect(config: config)
         stats = await engine.sourceStats(config: config)
         refreshVaultStatuses()
+        publishFinderStatus()
+    }
+
+    /// Republish what Finder should badge, for the Finder Sync extension to read.
+    ///
+    /// The extension cannot ask this process anything — it is started by Finder and may run before,
+    /// during or after the app — so the answer has to be a file. Called wherever the facts change: at
+    /// launch, after a sync or a verify (both end in `refresh`), and after settings are saved.
+    func publishFinderStatus() {
+        let index = FinderStatusIndex.build(config: config, paths: paths, progress: progress)
+        do {
+            // Two copies of the same bytes, on purpose: the state directory keeps it with the rest of
+            // what NeoDrop knows (and is what the tests and scripts/e2e.sh read), and the Finder
+            // extension's own container is the one place the sandboxed extension can read it from.
+            try index.write(to: paths)
+            try index.save(to: FinderStatusIndex.extensionContainerIndexURL())
+            NeoDropLog.shared.write(
+                "Finder badges updated: \(index.roots.count) folder(s), \(index.exceptions.count) needing attention",
+                level: .info
+            )
+        } catch {
+            // Not fatal: the badges go stale, the protection does not.
+            NeoDropLog.shared.write("Finder badges could not be updated: \(error.localizedDescription)", level: .warning)
+        }
     }
 
     /// Availability is a property of right now, not of the last sync: a share that has been
@@ -663,6 +725,8 @@ final class AppModel: ObservableObject {
         logIssues()
         restartWatcher()
         scheduleTimer()
+        // A folder added or removed in Settings becomes a folder Finder badges (or stops being one).
+        publishFinderStatus()
     }
 
     /// Put configuration problems in the log too, so "why does it say needs attention?" can be

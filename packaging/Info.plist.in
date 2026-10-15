@@ -34,6 +34,20 @@
   <string>@BUILD_SHA@</string>
   <key>CFBundleIconFile</key>
   <string>NeoDrop</string>
+  <!-- The Finder extension right-click menu opens this app's status window through this scheme. An
+       extension cannot build the report itself — it has no engine — so it asks the app, which is the
+       only thing that can answer honestly. -->
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>ai.storyteller.neodrop.status</string>
+      <key>CFBundleURLSchemes</key>
+      <array>
+        <string>neodrop</string>
+      </array>
+    </dict>
+  </array>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.utilities</string>
   <key>LSMinimumSystemVersion</key>
@@ -45,6 +59,28 @@
   <true/>
   <key>NSHumanReadableCopyright</key>
   <string>NeoDrop</string>
+  <!-- Finder → right-click → Services → “Show NeoDrop Status”, and the same item is available for
+       any file or folder so a path outside NeoDrop's folders gets an honest "not protected" answer
+       instead of a missing menu item. NSMessage names the selector AppDelegate implements, and
+       scripts/verify.sh checks the packaged bundle declares both it and the menu title. -->
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMenuItem</key>
+      <dict>
+        <key>default</key>
+        <string>Show NeoDrop Status</string>
+      </dict>
+      <key>NSMessage</key>
+      <string>showFileStatus</string>
+      <key>NSPortName</key>
+      <string>NeoDrop</string>
+      <key>NSSendFileTypes</key>
+      <array>
+        <string>public.item</string>
+      </array>
+    </dict>
+  </array>
   <key>NSSupportsAutomaticTermination</key>
   <false/>
   <key>NSSupportsSuddenTermination</key>

@@ -29,6 +29,10 @@ public enum WebUIError: Error, LocalizedError {
 public final class WebUIServer: @unchecked Sendable {
     public typealias ListHandler = @Sendable () async -> [DeletionEntry]
     public typealias RestoreHandler = @Sendable (_ relativePath: String) async throws -> URL
+    /// Answers "what does NeoDrop know about this path?" — the Finder service's back end. Returns
+    /// nil when the app cannot answer at all, which the page reports as a missing file rather than
+    /// as an empty report.
+    public typealias StatusHandler = @Sendable (_ path: String) async -> FileStatusReport?
 
     /// Longest request accepted, headers and body together. Bigger is a client with a problem.
     static let maximumRequestBytes = 64 * 1024
@@ -36,6 +40,7 @@ public final class WebUIServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "ai.storyteller.neodrop.webui")
     private let listHandler: ListHandler
     private let restoreHandler: RestoreHandler
+    private let statusHandler: StatusHandler?
     /// Random per launch and never persisted: the page URL is not a credential that outlives the
     /// run it was printed for.
     private let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
@@ -43,9 +48,16 @@ public final class WebUIServer: @unchecked Sendable {
     private var listener: NWListener?
     private var liveConnections: [NWConnection] = []
 
-    public init(list: @escaping ListHandler, restore: @escaping RestoreHandler) {
+    /// `status` is optional so the deleted-files half of the server can be constructed — and
+    /// tested — on its own; the route answers 404 until a handler is supplied.
+    public init(
+        list: @escaping ListHandler,
+        restore: @escaping RestoreHandler,
+        status: StatusHandler? = nil
+    ) {
         self.listHandler = list
         self.restoreHandler = restore
+        self.statusHandler = status
     }
 
     // MARK: - Lifecycle
@@ -200,6 +212,8 @@ public final class WebUIServer: @unchecked Sendable {
             return .html(WebUIPage.html(retentionDays: DeleteRecord.retentionDays))
         case ("GET", "/api/deletions"):
             return await deletionsResponse()
+        case ("GET", "/status"):
+            return await statusResponse(request)
         case ("POST", "/api/restore"):
             return await restoreResponse(for: request)
         case (_, "/"), (_, ""), (_, "/api/deletions"):
@@ -223,6 +237,21 @@ public final class WebUIServer: @unchecked Sendable {
         } catch {
             return .text(status: 500, "Could not encode the deletion list")
         }
+    }
+
+    /// The status page is rendered here rather than fetched by script: the report is the whole
+    /// page, and a document with no JavaScript in it has nothing to go wrong.
+    private func statusResponse(_ request: HTTPRequest) async -> HTTPResponse {
+        guard let statusHandler else {
+            return .text(status: 404, "Not found")
+        }
+        guard let path = HTTPRequest.query(of: request.target)["path"], path.hasPrefix("/") else {
+            return .text(status: 400, "Expected ?path=/absolute/path")
+        }
+        guard let report = await statusHandler(path) else {
+            return .text(status: 404, "No status for that path")
+        }
+        return .html(WebUIPage.statusHTML(for: report))
     }
 
     private func restoreResponse(for request: HTTPRequest) async -> HTTPResponse {
@@ -308,6 +337,26 @@ struct HTTPRequest {
     }
 
     /// The path part of the request target, without query or fragment.
+    /// The query parameters, percent-decoded. A file path travels in the query string, so the
+    /// decoding is not cosmetic: a folder called "Anna's Folder" arrives as `Anna%27s%20Folder`
+    /// and must be turned back into the name the file system knows.
+    static func query(of target: String) -> [String: String] {
+        guard let mark = target.firstIndex(of: "?") else { return [:] }
+        var query = String(target[target.index(after: mark)...])
+        if let hash = query.firstIndex(of: "#") { query = String(query[query.startIndex..<hash]) }
+        var result: [String: String] = [:]
+        for pair in query.split(separator: "&", omittingEmptySubsequences: true) {
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let name = String(parts[0])
+            let value = parts.count > 1 ? String(parts[1]) : ""
+            // `+` is deliberately *not* decoded as a space, unlike a form submission: a file name
+            // may contain a literal `+`, and treating it as a space would quietly answer about a
+            // different file. Spaces arrive percent-encoded, which is what the app sends.
+            result[name.removingPercentEncoding ?? name] = value.removingPercentEncoding ?? value
+        }
+        return result
+    }
+
     static func path(of target: String) -> String {
         var path = target.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? "/"
         if let hash = path.firstIndex(of: "#") { path = String(path[path.startIndex..<hash]) }

@@ -4,6 +4,10 @@
 #
 #   scripts/verify.sh            check build/NeoDrop.app and any DMG in build/
 #   scripts/verify.sh --smoke    also launch the bundled app for a few seconds
+#   scripts/verify.sh --dmg IMG  check that image instead of every one in build/ (repeatable). The
+#                                default checks the whole directory, which is what a release run
+#                                wants; this is for verifying one freshly built image while older
+#                                ones are still lying around.
 #
 # Checks the things a successful build alone does not prove: that the bundle declares itself a
 # menu bar app, that the executable actually runs, that the signature validates, that the DMG
@@ -19,9 +23,11 @@ BUILD="$ROOT/build"
 APP_NAME="NeoDrop"
 
 SMOKE=0
+CHOSEN_DMGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --smoke) SMOKE=1; shift ;;
+    --dmg) CHOSEN_DMGS+=("${2:-}"); shift 2 ;;
     -h|--help)
       sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -50,6 +56,18 @@ check "CFBundleShortVersionString is set" "test -n \"\$(/usr/libexec/PlistBuddy 
 check "LSUIElement is true (menu bar only, no Dock icon)" \
   "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' '$PLIST')\" = 'true' ]"
 check "icon resource exists" "[ -f '$APP/Contents/Resources/$APP_NAME.icns' ]"
+# The Finder service is declared in the plist and implemented in the app, and the two only work
+# together: Finder looks the NSMessage selector up in the running app, so a plist naming a selector
+# nobody implements gives a menu item that silently does nothing. Both halves are checked here, and
+# the menu title is checked because Finder prints it verbatim under Services.
+check "Finder service is declared with a menu title" \
+  "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :NSServices:0:NSMenuItem:default' '$PLIST')\" = 'Show NeoDrop Status' ]"
+check "Finder service names the showFileStatus selector" \
+  "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :NSServices:0:NSMessage' '$PLIST')\" = 'showFileStatus' ]"
+check "Finder service accepts files and folders" \
+  "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :NSServices:0:NSSendFileTypes:0' '$PLIST')\" = 'public.item' ]"
+check "the app implements the selector the service names" \
+  "grep -a -q 'showFileStatus' '$EXECUTABLE'"
 # Resources should hold exactly what the app needs — the icon, and the three menu bar icon
 # representations. A count would pass on the wrong three files and would need editing every time the
 # bundle legitimately gains one, so the expected list is spelled out and compared as a set.
@@ -102,6 +120,64 @@ check "bundle carries no source maps or build leftovers" \
   "! find '$APP' -name '*.dSYM' -o -name '.build' -o -name '*.swiftmodule' | grep -q ."
 check "signature validates strictly" "codesign --verify --strict '$APP'"
 
+# ---- the Finder extension ---------------------------------------------------------------------
+# The badges next to a file's date come from a Finder Sync extension, which is a bundle inside the
+# app that Finder loads. Everything here has failed silently at some point in development — the
+# extension simply never appeared in `pluginkit -m -p com.apple.FinderSync`, with nothing in any log:
+#
+#   * an appex whose executable is a dylib or a Mach-O *bundle* is never registered, and its
+#     signature cannot carry entitlements either;
+#   * an extension that is not sandboxed is refused by PlugInKit ("plug-ins must be sandboxed", in
+#     the system log only);
+#   * a sandboxed extension cannot read the app's Application Support directory, so without a channel
+#     it registers, runs and badges nothing. The channel is the extension's own container, which the
+#     app writes from outside. An App Group is *not* it: `~/Library/Group Containers` is closed to a
+#     non-sandboxed process, so an app-group entitlement makes the app look entitled while the index
+#     never lands — the checks below refuse it rather than leave that to be rediscovered;
+#   * a plist naming a class the binary does not export gives an extension that loads and does
+#     nothing.
+#
+# What works is what Xcode produces: an appex executable is Mach-O *executable* (MH_EXECUTE) linked
+# with `NSExtensionMain` as its entry point, which is what makes the Entitlements blob appear in the
+# signature. See build_extension_arch in scripts/package.sh.
+APPEX="$APP/Contents/PlugIns/NeoDropFinder.appex"
+EXTENSION_PLIST="$APPEX/Contents/Info.plist"
+EXTENSION_BINARY="$APPEX/Contents/MacOS/NeoDropFinder"
+check "Finder extension is embedded" "[ -d '$APPEX' ]"
+check "Finder extension's Info.plist is valid" "plutil -lint '$EXTENSION_PLIST'"
+check "Finder extension declares the FinderSync extension point" \
+  "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' '$EXTENSION_PLIST')\" = 'com.apple.FinderSync' ]"
+check "Finder extension names its principal class" \
+  "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPrincipalClass' '$EXTENSION_PLIST')\" = 'NeoDropFinderExtension' ]"
+check "Finder extension binary is a Mach-O executable (PlugInKit ignores a dylib or a bundle)" \
+  "file -b '$EXTENSION_BINARY' | grep -q 'Mach-O 64-bit executable'"
+check "Finder extension is a single architecture or fat, never empty" \
+  "[ \"\$(lipo -archs '$EXTENSION_BINARY' 2>/dev/null | tr -d ' ')\" != '' ]"
+# `strings … | grep -q` is not used here on purpose: `grep -q` exits at the first match, `strings` is
+# then killed by SIGPIPE, and with `pipefail` set the pipeline reports 141 — a check that fails or
+# passes depending on where in the file the match happens to be. Comparing the whole output is a
+# little wasteful and never flaky.
+check "the extension exports the class the plist names" \
+  "[[ \"\$(strings -a '$EXTENSION_BINARY')\" == *NeoDropFinderExtension* ]]"
+check "Finder extension is signed" "codesign --verify --strict '$APPEX'"
+# Entitlements in the signature are what PlugInKit reads before it will register the extension.
+# They only land there for an MH_EXECUTE, which is why the shape of the binary above matters.
+check "Finder extension carries the App Sandbox entitlement PlugInKit requires" \
+  "codesign -d --entitlements - --xml '$APPEX' 2>/dev/null | plutil -p - | grep -q 'com.apple.security.app-sandbox'"
+# An App Group cannot carry the badge index to the extension: the app is not sandboxed (it mirrors to
+# /Volumes), and `~/Library/Group Containers` refuses an unsandboxed writer. Declaring one again would
+# silently break every badge, so it is a failed check rather than a warning.
+check "neither bundle declares an App Group (it cannot be written by a non-sandboxed app)" \
+  "! codesign -d --entitlements - --xml '$APPEX' 2>/dev/null | grep -q 'application-groups' \
+     && ! codesign -d --entitlements - --xml '$APP' 2>/dev/null | grep -q 'application-groups'"
+# The app publishes into the container named after the extension's bundle identifier, so the two have
+# to be the same string on the built artefact, not just in the source. Renaming the extension in its
+# Info.plist without the constant in FinderStatus.swift would leave badges silently dead.
+check "the app publishes into the container of the extension it ships" \
+  "[[ \"\$(strings -a '$EXECUTABLE')\" == *\"\$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' '$EXTENSION_PLIST')\"* ]]"
+check "the app declares the neodrop:// scheme the extension uses" \
+  "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' '$PLIST')\" = 'neodrop' ]"
+
 # Gatekeeper: a failure here is expected for an ad-hoc build and must not fail the run.
 if spctl --assess --type execute "$APP" >/dev/null 2>&1; then
   pass "Gatekeeper accepts the app (notarized or locally trusted)"
@@ -147,7 +223,11 @@ fi
 
 # ---- DMG --------------------------------------------------------------------------------------
 shopt -s nullglob
-DMGS=("$BUILD"/*.dmg)
+if [ "${#CHOSEN_DMGS[@]}" -gt 0 ]; then
+  DMGS=("${CHOSEN_DMGS[@]}")
+else
+  DMGS=("$BUILD"/*.dmg)
+fi
 shopt -u nullglob
 
 # A copy of the image may already be attached — the user looking at it, or an interrupted run.
@@ -246,6 +326,10 @@ for DMG in ${DMGS[@]+"${DMGS[@]}"}; do
   check "app inside the dmg is signed" "codesign --verify --strict '$MOUNT/$APP_NAME.app'"
   check "app inside the dmg keeps its LSUIElement flag" \
     "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' '$MOUNT/$APP_NAME.app/Contents/Info.plist')\" = 'true' ]"
+  check "app inside the dmg still declares the Finder service" \
+    "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :NSServices:0:NSMessage' '$MOUNT/$APP_NAME.app/Contents/Info.plist')\" = 'showFileStatus' ]"
+  check "app inside the dmg still carries the Finder extension" \
+    "[ \"\$(/usr/libexec/PlistBuddy -c 'Print :NSExtension:NSExtensionPointIdentifier' '$MOUNT/$APP_NAME.app/Contents/PlugIns/NeoDropFinder.appex/Contents/Info.plist')\" = 'com.apple.FinderSync' ]"
 
   # The quarantine story only works if the app itself is not already flagged.
   if xattr -p com.apple.quarantine "$MOUNT/$APP_NAME.app" >/dev/null 2>&1; then

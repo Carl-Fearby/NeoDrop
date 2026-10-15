@@ -114,6 +114,7 @@ final class MenuController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
         add("Deleted Files…", #selector(openDeletedFiles), key: "d", enabled: model.deletedFilesAvailable)
+        add("File Status…", #selector(openFileStatus), key: "i", enabled: model.deletedFilesAvailable)
 
         menu.addItem(.separator())
         menu.addItem(replicasMenu())
@@ -121,6 +122,7 @@ final class MenuController: NSObject, NSMenuDelegate {
         menu.addItem(activityMenu())
 
         menu.addItem(.separator())
+        add("Set Up NeoDrop…", #selector(openSetup), key: "", enabled: true)
         add("Settings…", #selector(openSettings), key: ",", enabled: true)
         if Bundle.main.bundleIdentifier != nil {
             let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
@@ -374,6 +376,8 @@ final class MenuController: NSObject, NSMenuDelegate {
     @objc private func verifyAll() { model.verifyNow(repair: true) }
     @objc private func openSettings() { model.onOpenSettings?() }
     @objc private func openDeletedFiles() { model.onOpenDeletedFiles?() }
+    @objc private func openFileStatus() { model.onOpenFileStatus?(nil) }
+    @objc private func openSetup() { model.onOpenSetup?() }
     @objc private func toggleLaunchAtLogin() { model.setLaunchAtLogin(!model.launchAtLogin) }
     @objc private func openLogFolder() { model.openLog() }
     @objc private func quit() { NSApplication.shared.terminate(nil) }

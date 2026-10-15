@@ -1,4 +1,5 @@
 import Foundation
+import NeoDropShared
 
 /// Where NeoDrop keeps everything that is not the user's data.
 public struct StorePaths: Sendable {
@@ -29,6 +30,9 @@ public struct StorePaths: Sendable {
     public var vaultsDirectory: URL { base.appendingPathComponent("vaults", isDirectory: true) }
     /// This machine's identity: the name it puts on the journal it writes and on conflicted copies.
     public var machineURL: URL { base.appendingPathComponent("machine.json") }
+    /// What the Finder extension reads to badge files. Written by the app, read by another process
+    /// (Finder's), which is why it has to be a file and cannot be the app's memory.
+    public var finderStatusURL: URL { base.appendingPathComponent(FinderStatusIndex.fileName) }
 
     public func vaultCursorURL(vaultID: UUID) -> URL {
         vaultsDirectory.appendingPathComponent("\(vaultID.uuidString).json")

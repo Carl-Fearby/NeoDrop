@@ -1,10 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Hardened-runtime entitlements for NeoDrop. Deliberately empty: the app is a single Swift
-     binary that loads no unsigned code, needs no JIT, and is not sandboxed (it has to read and
-     write mounted network shares under /Volumes). Add exceptions here only with a reason in a
-     comment. -->
+<!-- Hardened-runtime entitlements for NeoDrop (the app). Deliberately empty, and that is a finding
+     rather than an oversight.
+
+     The app is a single Swift binary that loads no unsigned code, needs no JIT, and is not sandboxed:
+     it has to read and write mounted network shares under /Volumes, which the App Sandbox forbids.
+
+     It once declared `com.apple.security.application-groups`, on the theory that a sandboxed Finder
+     extension cannot read the app's own Application Support directory and a group container is the
+     one place both processes can reach. Measured on macOS 26, that theory does not survive contact
+     with an unsandboxed app: writing into `~/Library/Group Containers/…` fails with EPERM — as an
+     ad-hoc signature and signed with an Apple Development certificate alike — because group
+     containers are reachable only by sandboxed processes. The entitlement made the app *look*
+     entitled while the badge index silently never landed.
+
+     What works instead, and needs no entitlement at all, is publishing the index into the extension's
+     own container (`FinderStatusIndex.extensionContainerIndexURL`): that directory is an ordinary
+     one owned by the user, so the app can write it and the sandboxed extension reads it as its home.
+
+     Add anything here only with a reason in a comment, and check scripts/verify.sh still passes: it
+     refuses an App Group in this file, because it cannot work in a non-sandboxed app. -->
 <plist version="1.0">
-<dict>
-</dict>
+<dict/>
 </plist>

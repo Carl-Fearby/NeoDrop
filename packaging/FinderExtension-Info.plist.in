@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: scripts/package.sh substitutes @VERSION@, @SHORT_VERSION@, @BUILD_SHA@ and @MIN_OS@.
+
+     The Finder Sync extension: badges next to a file's date, and a right-click menu item. It lives
+     at NeoDrop.app/Contents/PlugIns/NeoDropFinder.appex and is loaded by Finder, not by the app.
+
+     NSExtensionPrincipalClass names the class the extension bundle exports. It is written without a
+     module prefix because Sources/NeoDropFinder/SyncExtension.swift declares it as
+     `@objc(NeoDropFinderExtension)` — the Swift mangled name (`NeoDropFinder.NeoDropFinderExtension`)
+     would work too, but the plain name is what `NSClassFromString` finds without guessing the module
+     name, and scripts/verify.sh checks the packaged bundle actually exports exactly this class. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>NeoDrop Finder</string>
+  <key>CFBundleName</key>
+  <string>NeoDropFinder</string>
+  <key>CFBundleExecutable</key>
+  <string>NeoDropFinder</string>
+  <key>CFBundleIdentifier</key>
+  <string>ai.storyteller.neodrop.finder</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundlePackageType</key>
+  <string>XPC!</string>
+  <!-- The platform keys an Xcode-built appex always carries. PlugInKit did not register this
+       extension without them: `pluginkit -m -p com.apple.FinderSync` listed every other Finder
+       extension and stayed silent about this one, with no error anywhere. They are written by hand
+       here because the bundle is assembled by scripts/package.sh rather than by Xcode. -->
+  <key>CFBundleSupportedPlatforms</key>
+  <array>
+    <string>MacOSX</string>
+  </array>
+  <key>DTPlatformName</key>
+  <string>macosx</string>
+  <key>DTPlatformVersion</key>
+  <string>@MIN_OS@</string>
+  <key>DTSDKName</key>
+  <string>macosx@MIN_OS@</string>
+  <!-- Finder extensions have no UI of their own; the marker keeps AppKit from trying. -->
+  <key>LSUIElement</key>
+  <true/>
+  <key>CFBundleShortVersionString</key>
+  <string>@SHORT_VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@SHORT_VERSION@</string>
+  <key>NeoDropVersion</key>
+  <string>@VERSION@</string>
+  <key>NeoDropBuildCommit</key>
+  <string>@BUILD_SHA@</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>@MIN_OS@</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>NeoDrop</string>
+  <key>NSExtension</key>
+  <dict>
+    <key>NSExtensionAttributes</key>
+    <dict/>
+    <key>NSExtensionPointIdentifier</key>
+    <string>com.apple.FinderSync</string>
+    <key>NSExtensionPrincipalClass</key>
+    <string>NeoDropFinderExtension</string>
+  </dict>
+</dict>
+</plist>
