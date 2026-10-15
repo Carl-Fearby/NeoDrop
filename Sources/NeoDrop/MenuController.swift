@@ -117,6 +117,7 @@ final class MenuController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
         menu.addItem(replicasMenu())
+        menu.addItem(vaultsMenu())
         menu.addItem(activityMenu())
 
         menu.addItem(.separator())
@@ -158,6 +159,95 @@ final class MenuController: NSObject, NSMenuDelegate {
             submenu.addItem(item)
         }
         return root
+    }
+
+    /// The two-way folders: one entry per vault, each with what the last reconcile did.
+    private func vaultsMenu() -> NSMenuItem {
+        let root = NSMenuItem(title: "Two-Way Folders", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        root.submenu = submenu
+
+        if model.config.vaults.isEmpty {
+            let item = NSMenuItem(title: "None yet — add one in Settings", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            submenu.addItem(item)
+            return root
+        }
+
+        for link in model.config.vaults {
+            let status = model.vaultStatuses[link.id] ?? VaultStatus(link: link)
+            let item = NSMenuItem(
+                title: "\(link.displayName) — \(link.enabled ? status.statusLine : "disabled")",
+                action: nil,
+                keyEquivalent: ""
+            )
+            item.submenu = vaultDetailMenu(status: status)
+            item.image = symbolImage(for: link.enabled ? status.status : .disabled)
+            submenu.addItem(item)
+        }
+        return root
+    }
+
+    private func vaultDetailMenu(status: VaultStatus) -> NSMenu {
+        let link = status.link
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        let lines = [
+            "This Mac: \(link.localPath)",
+            "Vault on the share: \(link.vaultPath)",
+            "This Mac is “\(model.machineName)” to the others",
+            status.detailLine,
+            "Last sync: \(Self.format(status.lastSync))",
+        ]
+        for line in lines {
+            let item = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            submenu.addItem(item)
+        }
+
+        if let error = status.summary?.errors.first {
+            let item = NSMenuItem(title: error, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            submenu.addItem(item)
+        }
+
+        submenu.addItem(.separator())
+        let sync = NSMenuItem(title: "Sync This Folder Now", action: #selector(syncVault(_:)), keyEquivalent: "")
+        sync.target = self
+        sync.representedObject = link.id
+        sync.isEnabled = !model.isBusy && link.enabled
+        submenu.addItem(sync)
+
+        if let smbURL = link.smbURL, !smbURL.isEmpty {
+            let mount = NSMenuItem(title: "Mount \(smbURL)…", action: #selector(mountVault(_:)), keyEquivalent: "")
+            mount.target = self
+            mount.representedObject = link.id
+            submenu.addItem(mount)
+        }
+
+        let revealVault = NSMenuItem(title: "Reveal the Vault in Finder", action: #selector(revealVaultPath(_:)), keyEquivalent: "")
+        revealVault.target = self
+        revealVault.representedObject = link.id
+        submenu.addItem(revealVault)
+
+        let revealLocal = NSMenuItem(title: "Reveal This Mac's Folder", action: #selector(revealVaultLocal(_:)), keyEquivalent: "")
+        revealLocal.target = self
+        revealLocal.representedObject = link.id
+        submenu.addItem(revealLocal)
+
+        let toggle = NSMenuItem(title: link.enabled ? "Stop Syncing" : "Start Syncing", action: #selector(toggleVault(_:)), keyEquivalent: "")
+        toggle.target = self
+        toggle.representedObject = link.id
+        submenu.addItem(toggle)
+
+        let remove = NSMenuItem(title: "Remove Two-Way Folder", action: #selector(removeVault(_:)), keyEquivalent: "")
+        remove.target = self
+        remove.representedObject = link.id
+        submenu.addItem(remove)
+
+        return submenu
     }
 
     private func replicaDetailMenu(snapshot: ReplicaSnapshot) -> NSMenu {
@@ -315,5 +405,41 @@ final class MenuController: NSObject, NSMenuDelegate {
         guard let id = sender.representedObject as? UUID,
               let replica = model.config.replica(id: id) else { return }
         model.removeReplica(replica)
+    }
+
+    @objc private func syncVault(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let link = model.config.vault(id: id) else { return }
+        model.syncVaultNow(link)
+    }
+
+    @objc private func mountVault(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let link = model.config.vault(id: id) else { return }
+        model.mountVault(link)
+    }
+
+    @objc private func revealVaultPath(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let link = model.config.vault(id: id) else { return }
+        model.reveal(link)
+    }
+
+    @objc private func revealVaultLocal(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let link = model.config.vault(id: id) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([link.localURL])
+    }
+
+    @objc private func toggleVault(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let link = model.config.vault(id: id) else { return }
+        model.toggleVault(link)
+    }
+
+    @objc private func removeVault(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let link = model.config.vault(id: id) else { return }
+        model.removeVault(link)
     }
 }

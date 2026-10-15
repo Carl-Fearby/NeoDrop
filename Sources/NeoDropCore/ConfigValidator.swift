@@ -23,13 +23,68 @@ public enum ConfigValidator {
     public static func validate(_ config: AppConfig, fileManager: FileManager = .default) -> [ConfigIssue] {
         var issues: [ConfigIssue] = []
 
-        if config.sources.isEmpty {
-            issues.append(ConfigIssue(severity: .error, message: "No source folder is selected, so there is nothing to protect."))
+        // A vault is a destination in its own right: a vault-only configuration protects
+        // everything it is asked to protect and must not be reported as empty.
+        if !config.hasVaults {
+            if config.sources.isEmpty {
+                issues.append(ConfigIssue(severity: .error, message: "No source folder is selected, so there is nothing to protect."))
+            }
+            if config.replicas.isEmpty {
+                issues.append(ConfigIssue(severity: .error, message: "No NAS destination is configured."))
+            } else if config.enabledReplicas.isEmpty {
+                issues.append(ConfigIssue(severity: .error, message: "Every NAS destination is disabled."))
+            }
         }
-        if config.replicas.isEmpty {
-            issues.append(ConfigIssue(severity: .error, message: "No NAS destination is configured."))
-        } else if config.enabledReplicas.isEmpty {
-            issues.append(ConfigIssue(severity: .error, message: "Every NAS destination is disabled."))
+
+        for link in config.vaults {
+            let vaultURL = link.vaultURL
+            let localURL = link.localURL
+            if contains(localURL, vaultURL) || contains(vaultURL, localURL) {
+                issues.append(ConfigIssue(
+                    severity: .error,
+                    message: "Two-way folder “\(link.displayName)” has its local folder and its vault nested inside one another (\(localURL.path) and \(vaultURL.path)), which would sync the synced files back into themselves. Point them at two separate folders."
+                ))
+            }
+            guard link.enabled else { continue }
+            if !MirrorEngine.isUsableDirectory(vaultURL) {
+                issues.append(ConfigIssue(severity: .error, message: "The vault for “\(link.displayName)” is not mounted at \(vaultURL.path)."))
+            }
+            if !MirrorEngine.isUsableDirectory(localURL) {
+                issues.append(ConfigIssue(
+                    severity: .error,
+                    message: "Two-way folder “\(link.displayName)” is not available at \(localURL.path) — create it or plug the volume in."
+                ))
+            }
+            if config.sources.contains(where: { contains($0.url, localURL) || contains(localURL, $0.url) }) {
+                issues.append(ConfigIssue(
+                    severity: .warning,
+                    message: "“\(link.displayName)” is also a source folder. The same files would be mirrored and two-way synced; keep them separate."
+                ))
+            }
+            for replica in config.enabledReplicas where contains(vaultURL, replica.url) || contains(replica.url, vaultURL) {
+                issues.append(ConfigIssue(
+                    severity: .warning,
+                    message: "The vault for “\(link.displayName)” is inside replica “\(replica.displayName)”, so the mirror would copy the vault's bookkeeping around."
+                ))
+            }
+        }
+
+        let duplicateVaults = Dictionary(grouping: config.enabledVaults, by: { $0.vaultURL.standardizedFileURL.path })
+            .filter { $0.value.count > 1 }
+        for (path, links) in duplicateVaults {
+            issues.append(ConfigIssue(
+                severity: .error,
+                message: "Two-way folders \(links.map { "“\($0.displayName)”" }.joined(separator: " and ")) point at the same vault (\(path)). One vault holds one tree."
+            ))
+        }
+
+        let duplicateLocals = Dictionary(grouping: config.enabledVaults, by: { $0.localURL.standardizedFileURL.path })
+            .filter { $0.value.count > 1 }
+        for (path, links) in duplicateLocals {
+            issues.append(ConfigIssue(
+                severity: .error,
+                message: "\(links.map { "“\($0.displayName)”" }.joined(separator: " and ")) both sync the folder \(path), which would fight over the same files."
+            ))
         }
 
         for source in config.sources {
@@ -98,10 +153,9 @@ public enum ConfigValidator {
             .map(\.element)
     }
 
+    /// Canonical comparison, so `/var/...` and `/private/var/...` are recognised as one folder
+    /// (`PathIdentity`) rather than reported as an overlap or missed as one.
     private static func contains(_ parent: URL, _ child: URL) -> Bool {
-        let p = parent.standardizedFileURL.path
-        let c = child.standardizedFileURL.path
-        if p == c { return true }
-        return c.hasPrefix(p + "/")
+        PathIdentity.contains(parent, child)
     }
 }

@@ -4,20 +4,24 @@ Guidance for automated agents working in this repository.
 
 ## What this is
 
-NeoDrop is a macOS menu bar app (Swift 6, SPM, `NeoDropCore` library + `NeoDrop` executable) that
-mirrors local folders to multiple mounted NAS shares, verifies them by checksum and repairs them.
-There is no server and no cloud component.
+NeoDrop is a macOS menu bar app (Swift 6, SPM, `NeoDropCore` library + `NeoDrop` executable) with
+two modes. A **replica** is a one-way mirror: local folders copied in full to mounted NAS shares,
+verified by checksum and repaired. A **vault** (`VaultLink`) is a two-way Dropbox-shaped folder: one
+local working copy paired with one shared tree on a share, with every machine that points at it
+publishing and applying changes. Both can be configured at once and run independently. There is no
+server and no cloud component.
 
 ## Commands
 
 ```bash
 swift build                                        # compile everything
-swift test                                         # 103 engine tests, must stay green
+swift test                                         # 146 engine tests, must stay green
 swift run NeoDrop                                  # run the app (menu bar icon)
 swift build -c release --show-bin-path             # locate the release binary
 scripts/package.sh [--arch universal] [--no-dmg]   # .app + DMG, ad-hoc signed by default
 scripts/verify.sh --smoke                          # bundle, signature, DMG and a real launch
 scripts/e2e.sh [--keep]                            # drive the packaged app against fake NAS folders
+scripts/e2e-vault.sh [--keep]                      # two real installs, one vault: both directions
 scripts/fake-nas.sh create 3 | destroy | list      # real mounted volumes to test against
 swift scripts/make-icon.swift build/NeoDrop.icns --source Resources/AppIcon.png --verify
 swift scripts/verify-menubar-icon.swift                        # menu bar template icon checks
@@ -54,6 +58,75 @@ behaviour, change the test only with a written reason.
 8. **A record is data, not a command.** Every path read out of a record is checked to be inside the
    directory it belongs in before anything is deleted, written or restored
    (`testRecordThatEscapesTheTrashDirectoryIsNeverActedOn`).
+9. **A two-way folder and its vault are never created, and never nested in one another.** Both must
+   already exist, and they must be disjoint; overlap is refused before existence is even checked,
+   because "the share is not mounted" is the wrong thing to tell someone whose vault is inside the
+   folder it syncs (`testMissingLocalFolderIsRefusedRatherThanCreated`,
+   `testVaultInsideTheLocalFolderIsRefused`).
+10. **A conflict keeps both versions.** The vault's content keeps the original name and this
+    machine's version becomes a conflicted copy, published so the other machines converge on the
+    same result (`testSimultaneousEditsKeepBothVersionsOnBothMachines`).
+11. **Changes on the share are never ordered by a clock alone.** Timestamps carry milliseconds and,
+    when two entries share an instant, the entry written on top of the other's content wins
+    (`testBackToBackEditsWithinTheSameSecondAllPropagate`). Whole-second timestamps made two edits
+    compare equal and the machine-id tie-break then *reverted a real edit* — reproduced, then fixed.
+12. **Bytes land on the share before the journal records them**, so a crash in between re-publishes
+    a change rather than losing one. A torn final journal line is ignored; a torn middle one is
+    reported as corruption (`testTornJournalLineIsIgnoredAndTheChangeIsRepublished`,
+    `testBytesOnTheShareWithoutAJournalLineAreAnnouncedByTheNextSync`).
+13. **The bulk-deletion guard covers remote deletions too.** A journal that would empty a folder is
+    held back on the receiving machine, not applied (`testRemoteBulkDeletionIsHeldBackOnTheReceivingMachine`).
+14. **A restore into a two-way folder is an undelete, and it is recorded as one.** A file put back
+    through the recovery window is published as new content so every machine gets it back; a Mac that
+    merely missed the deletion keeps a conflicted copy and the deletion stands
+    (`testADeletionFromAnotherMachineIsRestorableAndTheUndeleteIsPublished`). `PendingUndeleteStore`
+    is what distinguishes the two — they are indistinguishable in the folder itself.
+15. **Paths are compared canonically** (`PathIdentity`), never as raw strings. `/var` and
+    `/private/var` are the same directory, and `FileManager`'s enumerator returns the `/private`
+    spelling while configuration files hold the other one — comparing them raw made a configured
+    folder disagree with itself and refused a legitimate restore
+    (`testTheTwoSpellingsOfVarAreOneDirectory`, and the right fix is *never* a raw
+    `hasPrefix` on `URL.path`).
+16. **A config file that fails to decode must never be treated as an empty configuration.**
+    `AppConfig` decodes by hand with defaults for missing keys, so an older file (no `vaults`) or a
+    newer key loads rather than silently forgetting every source and destination
+    (`testDecodesAConfigWrittenBeforeVaultsExisted`).
+
+## Two-way sync (`Vault.swift`, `VaultSync.swift`)
+
+The model, in one paragraph: the share holds the canonical tree as ordinary files, plus a hidden
+`.neodrop/` directory with an identity, **one append-only journal file per machine** (so writers
+never contend) and content-addressed **versions** of anything overwritten or deleted. Each machine
+keeps its own identity and a **cursor** locally — the content it and the vault last agreed on — and
+the reconcile is a three-way merge per path: local-only change → publish; vault-only change → apply;
+both → conflict; deleted locally → publish a deletion; deleted remotely and unchanged here → move
+into this machine's `.neodrop-trash/` with a record.
+
+Things that are easy to get wrong and are therefore deliberate:
+
+* **Cursors and identities are local, never in the vault.** A machine that shared another's identity
+  would be a second writer on one journal file.
+* **Ordering** is `JournalEntry.precedes`: milliseconds first, then causality (`previousSha256`
+  pointing at the other entry's `sha256` means "written on top of it"), then a deterministic
+  machine/seq tie-break that is arbitrary but identical on every machine. Never order by mtime across
+  machines, and never by whole-second timestamps — that was a real, reproduced data-reverting bug.
+* **Paths are normalised** (NFC, and case-folded for the comparison key) before they are used as keys,
+  because macOS hands out decomposed Unicode and SMB mostly ignores case: comparing raw spellings
+  shows up as permanent phantom conflicts. `Scanner.relativePath` keeps the on-disk spelling for
+  touching the filesystem; `VaultPath.key` is what everything compares.
+* **Hidden files sync in vault mode.** `Scanner.scan(includeHidden:)` exists for this: a two-way tool
+  that quietly skipped `.env` would be a trap. `.neodrop/` and `.neodrop-trash/` are always skipped
+  (`hardSkips`), on both sides.
+* **Files a person put in the vault by hand are adopted**, attributed to the machine that noticed
+  them, including at a path a tombstone covers. A share that ignores what is dropped into it is not a
+  share. Adoption is not a licence to lose anything: publishing over bytes that no journal mentions
+  retains them first, by hash.
+* **A restore is an undelete, and it has to be written down.** `PendingUndeleteStore` (local, keyed
+  by link id) marks a file the user put back through “Deleted Files…”, because the reconcile cannot
+  tell that from a Mac that was asleep through the deletion — and those two must resolve differently.
+  Markers are dropped once published, and pruned when the path is no longer a tombstone.
+* **No `pruneEmptyDirectories` on the local side.** On a replica an empty directory is leftovers; a
+  person's working copy is not NeoDrop's to tidy.
 
 ## The deleted-files web view
 
@@ -180,6 +253,9 @@ Gotchas worth keeping:
 * The engine takes configuration as a parameter and must never re-read `config.json` from disk to
   interpret its own arguments.
 * Home-grown state files are JSON written through `JSONFile.save` (temp + atomic replace).
+* Never compare `URL.path` strings with `hasPrefix`. Use `PathIdentity`, which resolves the existing
+  prefix of a path and appends the rest, so `/var/x` and `/private/var/x` agree and a file that no
+  longer exists still compares against its folder.
 * Shell scripts are `set -euo pipefail` or `set -uo pipefail`, POSIX-ish, and must run under the
   system `bash` 3.2 — no `${var,,}`, no associative arrays, no `mapfile`.
 * Packaged apps are ad-hoc signed by default; assume no Developer ID is available.
@@ -190,6 +266,22 @@ Gotchas worth keeping:
 `Tests/NeoDropCoreTests/Support.swift` provides `Sandbox`: a temp source folder plus N fake NAS
 directories. It mints stable UUIDs once — manifests and the source index are keyed by UUID, so
 handing out a fresh `Replica` per call silently points the engine at a different manifest.
+
+`VaultSyncTests.swift` has its own `VaultSandbox`: one share directory and N *machines*, each with
+its own state directory, its own `MachineIdentity` and its own local folder — two installs, which is
+the arrangement the feature is for. A machine is `sandbox.sync(index)`; the assertion helpers are
+`localFiles`, `vaultFiles` (the live tree, hidden files included, `.neodrop/` excluded),
+`retainedVersions`, `trashFiles` and `journalLines`.
+
+Two things to know when writing these tests:
+
+* Timestamps matter. Anything that depends on ordering has to assume two changes can land in the
+  same second — `testBackToBackEditsWithinTheSameSecondAllPropagate` is the regression test for the
+  bug that made this non-negotiable.
+* `scripts/e2e-vault.sh` is the end-to-end counterpart: it runs two real app instances (two
+  `NEODROP_HOME` state directories) against one vault, so what it proves is the product, not the
+  library. It uses the SwiftPM binary rather than the packaged `.app` because LaunchServices will not
+  start a second copy of the same bundle — and two machines is the point.
 
 `XCTUnwrap` takes an autoclosure and cannot contain `await`; use the local `unwrap(_:)` helper for
 async engine calls.

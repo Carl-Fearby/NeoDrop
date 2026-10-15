@@ -3,10 +3,22 @@
   <sub>Verified with SHA-256, repaired from whichever copy is still healthy. macOS 14+. Native Swift, no Electron, no cloud.</sub>
 </p>
 
-NeoDrop lives in the title bar. You point it at one or more local folders and at every mounted NAS
-share; it mirrors the folders in full to each share, checks the copies against their checksums, and
-rebuilds any copy that has rotted, been truncated, or disappeared. Dropbox gives you *a* copy you
-don't control. NeoDrop gives you *the same folder on three machines in your own house*.
+NeoDrop lives in the title bar, with two modes that can run side by side.
+
+**Mirror** — the original job. Point it at one or more local folders and at every mounted NAS share;
+it copies the folders in full to each share, verifies the copies against their checksums, and rebuilds
+any copy that has rotted, been truncated or disappeared. One writer per share: an excellent backup.
+
+**Two-way folders** — the Dropbox-shaped job. Point two or more Macs at the same vault on a share
+and each one keeps the whole tree: change a file on any of them and it appears on the others, delete
+one and it is gone everywhere (and recoverable for 30 days), and a Mac joining later pulls the whole
+thing down on its first sync. The share is still just a folder of ordinary files you can browse and
+open — Dropbox gives you *a* copy you don't control; NeoDrop gives you *the same folder on three
+machines in your own house*.
+
+They are different jobs and the app says so out loud rather than conflating them: a mirror is
+one-way and single-writer, and pointing two machines at one mirror folder is how a file gets silently
+overwritten. If you want edits on both machines, that is a two-way folder.
 
 ## Why it exists
 
@@ -15,7 +27,9 @@ hand works right up until the day you forget. NeoDrop is the boring, always-on v
 habit:
 
 * **Full mirror, not sync-with-a-server.** Every destination holds a complete, browsable copy. If
-  this app dies tomorrow, your data is still just files on a share.
+  this app dies tomorrow, your data is still just files on a share. That holds in two-way mode too:
+  the vault is a real folder on the share, and NeoDrop's bookkeeping lives in a hidden `.neodrop/`
+  directory inside it.
 * **Checksums, not timestamps.** Verification re-reads and re-hashes. A file that is the right
   size and the wrong bytes is *not* healthy — see `testVerifyDetectsSilentCorruption`.
 * **Repair from anywhere.** A bad copy is rewritten from the source, or from another replica when
@@ -58,6 +72,57 @@ are dropped from the list, and entries are purged — bytes and record together 
 window closes. Turning `mirrorDeletions` off still makes a destination an archive that keeps
 everything; such a destination records nothing because it deletes nothing.
 
+### Two-way folders
+
+A two-way folder is one local folder paired with one **vault** on a share. The vault holds the
+canonical tree — the live files where you would expect them, browsable in Finder — plus a hidden
+`.neodrop/` directory holding the identity and one append-only journal per machine:
+
+```
+/Volumes/NAS/Shared/            the vault: ordinary files, one folder, every machine sees the same tree
+  Documents/report.txt
+  Photos/…
+  .neodrop/
+    vault.json                  the vault's identity, adopted by every machine that points at it
+    journals/<machine-id>.jsonl  one file per machine, append-only: what that machine did, in order
+    versions/<sha256>            content that was overwritten or deleted, kept against a mistake
+```
+
+One journal per machine is what makes concurrent writers safe without locks: a machine only ever
+appends to its own file, and every machine reads all of them. Each machine keeps its own identity
+and a **cursor** — the content it and the vault last agreed on — in local state, which is the merge
+base for every path:
+
+* only this machine changed it → publish it to the vault;
+* only the vault changed it → take the vault's copy;
+* both changed it → a **conflict**, and both versions are kept rather than one being picked;
+* this machine deleted it → publish the deletion, which no machine then undoes;
+* deleted elsewhere and unchanged here → move it into that machine's `.neodrop-trash/`, recoverable
+  for 30 days through the same **Deleted Files…** window;
+* deleted elsewhere and *restored here* through that window → published as new content, so the file
+  is back on every Mac rather than only on this one.
+
+The last pair is why a restore is recorded rather than inferred: a Mac that was asleep through a
+deletion and a Mac whose user just pressed Restore look exactly alike — a file sitting at a path the
+journal calls deleted. The deletion has to win in the first case (that is what makes deleting on one
+Mac stick) and lose in the second, so NeoDrop writes down which one it is.
+
+**Joining a new Mac is one step.** Point it at the same vault with its own local folder: the first
+sync reads the journals, pulls every file down, and starts publishing that machine's own changes.
+If the folder it is given already holds files, those are published too — and any path that differs
+from the vault becomes a conflicted copy rather than a silent overwrite.
+
+**Nothing is decided by a clock alone.** Ordering is by timestamp with millisecond precision, and
+when two entries share an instant the one written *on top of* the other's content wins — causality
+rather than a guess, so machines with skewed clocks still agree. A conflict never loses data: the
+loser is kept as `<name> (<machine>'s conflicted copy <date>).<ext>` and published, and the bytes
+that were replaced are retained in `.neodrop/versions/` as well.
+
+**The vault is a folder, so files dropped into it count.** Put a file into the vault with Finder and
+the next sync adopts it and hands it to every machine — including at a path the journal says was
+deleted, because a file that is physically there is content, not a tombstone. Bytes already at a
+path that a machine is about to overwrite are retained first, so a hand-placed file is never lost.
+
 ### The rules that keep it safe
 
 These are the things that decide whether a tool like this protects data or destroys it, so they are
@@ -73,15 +138,23 @@ all enforced in code and covered by tests:
 | A deletion is recorded before it happens, and its bytes are kept for 30 days | "Undo" is the difference between a mirror and a shredder: a mistaken delete stays recoverable on every share |
 | A restore never overwrites, and never deletes ahead of its window | The copy in the trash is often the only copy left of a file, so nothing may be destroyed early or clobbered |
 | Paths read out of a record are checked against the directory they belong in | Records are editable JSON; a corrupt one must not be able to point a delete or a restore anywhere else |
+| A two-way folder's local side and its vault must be separate folders, and both must already exist | A vault nested in the folder it syncs copies files into themselves; creating either one would sync onto the boot volume when a disk is unplugged |
+| Nothing is ever destroyed to resolve a conflict | The losing version is kept beside the original and in `.neodrop/versions/` — the one part of a sync tool users never forgive getting wrong |
+| A change is on the share before the journal records it | A crash between the two leaves a change that is simply re-published, never a file nobody knows about |
+| A torn last journal line is ignored, a torn middle one is reported | A pulled cable during an append is normal; damage in the middle of a file is corruption and must be said out loud |
+| Deletions arriving from another machine face the same bulk guard as a mirror's | A corrupt or hand-edited journal must not be able to empty a folder in one sync |
+| `.neodrop/` and `.neodrop-trash/` are never published or applied | A sync tool that syncs its own bookkeeping feeds on its own output |
 
 A missing source folder, an offline share, or a failed write never stops the other replicas from
-being brought up to date; it is reported and shown as degraded instead.
+being brought up to date; it is reported and shown as degraded instead. The same is true across
+modes: a one-way mirror and a two-way folder each run on their own, so a share that cannot be
+reached for one does not stop the other.
 
 ## Build and run from source
 
 ```bash
 swift build                 # library + app
-swift test                  # 103 engine tests
+swift test                  # 146 engine tests
 swift run NeoDrop           # menu bar icon appears immediately (reads/writes ~/Library/Application Support/NeoDrop)
 ```
 
@@ -92,7 +165,8 @@ scripts/setup-dmg-tools.sh              # one-off: installs dmgbuild into .venv 
 scripts/package.sh                      # host architecture, ad-hoc signed
 scripts/package.sh --arch universal     # Intel + Apple Silicon
 scripts/verify.sh --smoke               # structural checks plus a real 4-second launch
-scripts/e2e.sh                          # drives the built app against simulated NAS folders
+scripts/e2e.sh                          # drives the packaged app against simulated NAS folders
+scripts/e2e-vault.sh                    # two real installs, one vault: edits both ways, a Mac joining, a deletion
 ```
 
 Output: `build/NeoDrop.app` and `build/neodrop-<version>-macos-<arch>.dmg`.
@@ -243,6 +317,20 @@ NeoDrop refuses to guess, so it starts with nothing configured.
 The menu shows each replica's status, file count, last sync and last verify, plus **Sync Now**,
 **Verify & Repair All**, **Deleted Files…**, a per-replica verify, and an activity log.
 
+### Setting up two-way folders
+
+1. **Two-Way** → *Add Two-Way Folder…* — pick the folder on this Mac, then the vault on the mounted
+   share. Repeat on the other Macs, pointing them at the *same* vault folder and their own local
+   folder. Each Mac syncs immediately; the one that arrives first creates the vault.
+2. Give each Mac a name in the same tab. That name is what appears on a conflicted copy, so it is
+   worth making it recognisable — the first machine to write a copy keeps it.
+3. Macs pick up each other's changes within seconds (the share is watched), and at the scheduled
+   sync interval as a backstop. A share's filesystem events are best effort, so the schedule matters.
+4. To stop syncing, turn the folder off or remove it — nothing is deleted on either side.
+
+A two-way setup needs no source and no replica: it is a complete configuration on its own, and the
+app will not claim otherwise.
+
 ### Trying it without a NAS
 
 ```bash
@@ -256,8 +344,11 @@ the warning when two replicas share a volume.
 ## Layout
 
 ```
-Sources/NeoDropCore/     engine: scanning, hashing, mirroring, verification, repair
-  MirrorEngine.swift     sync / verify / repair, the deletion guard, retention + restore
+Sources/NeoDropCore/     engine: scanning, hashing, mirroring, verification, repair, two-way sync
+  MirrorEngine.swift     one-way sync / verify / repair, the deletion guard, retention + restore
+  Vault.swift            vault + machine identity, the append-only journal, path normalisation,
+                         retained versions, the local cursor
+  VaultSync.swift        the two-way reconciler: publish, apply, seed, adopt, conflicts
   WebUIServer.swift      loopback HTTP server behind the deleted-files window
   WebUIPage.swift        the deleted-files page: one self-contained document
   Scanner.swift          enumeration, excludes, cached source hashes
@@ -267,7 +358,9 @@ Sources/NeoDropCore/     engine: scanning, hashing, mirroring, verification, rep
   ConfigValidator.swift  "this configuration does not actually protect anything" checks
   FolderWatcher.swift    FSEvents with debounce
 Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, deleted-files web view
-Tests/NeoDropCoreTests/  103 tests, including one per safety rule above
+  VaultsTab.swift        the Two-Way settings tab
+  VaultStatus.swift      per-folder display state for the menu and Settings
+Tests/NeoDropCoreTests/  146 tests, including one per safety rule above
 Resources/AppIcon.png    master app-icon artwork, masked by scripts/make-icon.swift
 Resources/MenuBarIcon*.png  menu bar template icon at 1x/2x/3x, plus the .svg master
 Resources/dmg-background.png  installer window wallpaper, as supplied (the master)
@@ -277,26 +370,43 @@ scripts/                 build, icon generation, packaging, verification, e2e, f
   make-dmg-artwork.swift  crops + darkens the wallpaper into the 1x/@2x pair and writes the layout
   dmg-layout.swift, make-dmg-background.swift  the earlier measuring pipeline, now unused
   make-dmg.py            builds the drag-and-drop DMG and verifies the written layout
+  e2e-vault.sh           two real installs against one vault: both directions, joining, deletions
   setup-dmg-tools.sh     installs dmgbuild into .venv (optional, for the layout)
 packaging/               Info.plist template, entitlements
 build/                   generated: NeoDrop.app, .icns, .dmg
 ```
 
 State lives in `~/Library/Application Support/NeoDrop/`: `config.json`, a manifest per replica, the
-source hash index, `runtime-state.json`, a rolling `neodrop.log`, and `deletes/` — one file per
-replica listing the deletions it is still holding. Delete that folder and NeoDrop forgets everything
-— your data is unaffected, but the retained copies in `.neodrop-trash/` become files with no record
-pointing at them, which is what the delete-first purge order is designed to avoid.
+source hash index, `runtime-state.json`, a rolling `neodrop.log`, `deletes/` — one file per
+replica listing the deletions it is still holding — and, for two-way folders, `machine.json` (this
+Mac's identity) plus `vaults/<id>.json` (the cursor per vault). Delete that folder and NeoDrop
+forgets everything — your data is unaffected, but the retained copies in `.neodrop-trash/` become
+files with no record pointing at them, which is what the delete-first purge order is designed to
+avoid.
 
-Set `NEODROP_HOME` to run the app against a different state directory (used by `scripts/e2e.sh`).
+Every piece of per-machine state is local; the only thing shared is the vault itself. That is
+deliberate: two machines must never write the same file, and a machine that copied another's
+identity would do exactly that.
+
+Set `NEODROP_HOME` to run the app against a different state directory (used by `scripts/e2e.sh`);
+pointing two of them at one vault is how `scripts/e2e-vault.sh` runs two machines on one Mac.
 
 ## Not built yet
 
 Deliberate omissions, roughly in order of value:
 
-* **File history / versioning.** A deletion is recoverable for 30 days, but *overwriting* a file is
-  not: the previous contents are gone the moment the new copy lands. Keeping the last N versions of
-  a file that changed would close the last way to lose data.
+* **File history / versioning, in mirror mode.** A deletion is recoverable for 30 days everywhere,
+  and a two-way folder keeps the previous contents of anything it overwrites in `.neodrop/versions/`
+  for the same window. A *mirror* still has no versioning at all: the previous contents are gone the
+  moment the new copy lands. A “Versions” browser over those retained blobs is the natural next step.
+* **Making two-way folders work with a Mac that is asleep or offline for weeks.** Nothing is
+  corrupted — the journal is append-only and the cursor is per machine — but a machine that was away
+  for a long time does all its catching up in one sync, and a very large vault then means a long
+  first sync with no resumability beyond retrying.
+* **A share that disagrees with its own journal.** A file deleted or truncated *on the share* is put
+  back from retained content, and the bytes on the share are checked by size on every sync; a
+  same-size corruption needs **Verify & Repair** (which re-hashes). An index of what the share holds
+  would make that cheap enough to do more often.
 * **Erasure coding.** Full mirrors cost N× the storage. Sharding files so any K of N replicas can
   rebuild them would make large libraries practical, at the cost of "your data is still just files".
 * **Restoring a source from a replica.** Repair can rebuild a replica from the source or another

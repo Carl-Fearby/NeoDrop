@@ -578,6 +578,28 @@ public actor MirrorEngine {
 
     // MARK: - Deleted files: list, restore, purge
 
+    /// A place that holds retained copies of deleted files: a replica, or the local folder of a
+    /// two-way vault link (a deletion another machine published moves the file into that folder's
+    /// trash, exactly like a mirrored deletion does).
+    ///
+    /// Recovery has to treat both the same way, or a vault's trash would grow forever and a file
+    /// deleted from one Mac could never be listed, let alone restored.
+    struct DeleteDestination {
+        var id: UUID
+        var name: String
+        /// The root the retained copies live under, in `.neodrop-trash/`.
+        var root: URL
+        var isAvailable: Bool
+    }
+
+    static func deleteDestinations(config: AppConfig) -> [DeleteDestination] {
+        config.replicas.map {
+            DeleteDestination(id: $0.id, name: $0.displayName, root: $0.url, isAvailable: isUsableDirectory($0.url))
+        } + config.vaults.map {
+            DeleteDestination(id: $0.id, name: $0.displayName, root: $0.localURL, isAvailable: isUsableDirectory($0.localURL))
+        }
+    }
+
     /// Everything the deleted-files view shows, aggregated across destinations.
     ///
     /// `relativePath` is the identity: each replica records the same logical deletion
@@ -591,21 +613,21 @@ public actor MirrorEngine {
         var recordsByPath: [String: [DeleteRecord]] = [:]
         var copiesByPath: [String: [DeletionCopy]] = [:]
 
-        for replica in config.replicas {
-            let records = store.load(replicaID: replica.id)
+        for destination in Self.deleteDestinations(config: config) {
+            let records = store.load(replicaID: destination.id)
             guard !records.isEmpty else { continue }
             // A reachable destination with a retained copy is what makes an entry restorable;
             // an unmounted share is reported as unavailable rather than assumed gone.
-            let reachable = Self.isUsableDirectory(replica.url)
-            let trashRoot = self.trashRoot(replica.url)
+            let reachable = destination.isAvailable
+            let trashRoot = self.trashRoot(destination.root)
             for record in records where record.expiresAt > now {
-                let trashURL = record.trashURL(onReplicaRoot: replica.url)
+                let trashURL = record.trashURL(onReplicaRoot: destination.root)
                 let available = reachable
                     && Self.isInside(trashURL, of: trashRoot)
                     && fm.fileExists(atPath: trashURL.path)
                 recordsByPath[record.relativePath, default: []].append(record)
                 copiesByPath[record.relativePath, default: []].append(
-                    DeletionCopy(replicaID: replica.id, replicaName: replica.displayName, available: available)
+                    DeletionCopy(replicaID: destination.id, replicaName: destination.name, available: available)
                 )
             }
         }
@@ -649,14 +671,15 @@ public actor MirrorEngine {
     public func restore(relativePath: String, config: AppConfig) throws -> URL {
         let store = DeleteStore(paths: paths)
         let fm = FileManager.default
+        let destinations = Self.deleteDestinations(config: config)
 
-        var recordByReplica: [UUID: DeleteRecord] = [:]
-        for replica in config.replicas {
-            if let record = store.load(replicaID: replica.id).first(where: { $0.relativePath == relativePath }) {
-                recordByReplica[replica.id] = record
+        var recordByDestination: [UUID: DeleteRecord] = [:]
+        for destination in destinations {
+            if let record = store.load(replicaID: destination.id).first(where: { $0.relativePath == relativePath }) {
+                recordByDestination[destination.id] = record
             }
         }
-        guard let primary = recordByReplica.values.min(by: { $0.deletedAt < $1.deletedAt }) else {
+        guard let primary = recordByDestination.values.min(by: { $0.deletedAt < $1.deletedAt }) else {
             throw NeoDropError.retainedCopyUnavailable(relativePath)
         }
         // No digest means no way to tell a good copy from a corrupt one, so there is nothing to
@@ -681,11 +704,11 @@ public actor MirrorEngine {
 
         var lastError: Error = NeoDropError.retainedCopyUnavailable(relativePath)
         var restored = false
-        // Replicas are tried in the order the user configured them, so the fastest share wins.
-        for replica in config.replicas {
-            guard let record = recordByReplica[replica.id], Self.isUsableDirectory(replica.url) else { continue }
-            let trashURL = record.trashURL(onReplicaRoot: replica.url)
-            guard Self.isInside(trashURL, of: trashRoot(replica.url)),
+        // Destinations are tried in the order the user configured them, so the fastest share wins.
+        for destination in destinations {
+            guard let record = recordByDestination[destination.id], destination.isAvailable else { continue }
+            let trashURL = record.trashURL(onReplicaRoot: destination.root)
+            guard Self.isInside(trashURL, of: trashRoot(destination.root)),
                   fm.fileExists(atPath: trashURL.path) else { continue }
             do {
                 let digest = try Hashing.sha256(ofFileAt: trashURL)
@@ -706,6 +729,14 @@ public actor MirrorEngine {
         }
         guard restored else { throw lastError }
 
+        // A restore into a two-way folder is an instruction to undo the deletion on every machine,
+        // and the next reconcile cannot tell it apart from a Mac that was merely offline. Say which
+        // one it is (`PendingUndeleteStore`), so this becomes an undelete rather than a copy beside
+        // the original while the deletion stands.
+        if config.vaults.contains(where: { $0.id == target.source.id }) {
+            PendingUndeleteStore(paths: paths).mark(relativePath: relativePath, sha256: primary.sha256, linkID: target.source.id)
+        }
+
         discardRetainedCopies(relativePath: relativePath, config: config)
         return target.destination
     }
@@ -722,14 +753,14 @@ public actor MirrorEngine {
         let now = Date()
         var purged = 0
 
-        for replica in config.replicas {
+        for destination in Self.deleteDestinations(config: config) {
             // An unmounted share must be skipped, not treated as empty: its retained copies are
             // still there, and dropping the records now would orphan them forever.
-            guard Self.isUsableDirectory(replica.url) else { continue }
-            let records = store.load(replicaID: replica.id)
+            guard destination.isAvailable else { continue }
+            let records = store.load(replicaID: destination.id)
             guard records.contains(where: { $0.expiresAt <= now }) else { continue }
 
-            let trashRoot = self.trashRoot(replica.url)
+            let trashRoot = self.trashRoot(destination.root)
             var kept: [DeleteRecord] = []
             var changed = false
             for record in records {
@@ -737,7 +768,7 @@ public actor MirrorEngine {
                     kept.append(record)
                     continue
                 }
-                let trashURL = record.trashURL(onReplicaRoot: replica.url)
+                let trashURL = record.trashURL(onReplicaRoot: destination.root)
                 guard Self.isInside(trashURL, of: trashRoot) else {
                     // A record that points outside the trash directory is not ours to act on:
                     // drop it and never touch the file it names.
@@ -753,7 +784,7 @@ public actor MirrorEngine {
                 purged += 1
                 changed = true
             }
-            if changed { try? store.save(kept, for: replica.id) }
+            if changed { try? store.save(kept, for: destination.id) }
         }
         return purged
     }
@@ -806,22 +837,22 @@ public actor MirrorEngine {
     private func discardRetainedCopies(relativePath: String, config: AppConfig) {
         let store = DeleteStore(paths: paths)
         let fm = FileManager.default
-        for replica in config.replicas {
-            guard Self.isUsableDirectory(replica.url) else { continue }
-            let records = store.load(replicaID: replica.id)
+        for destination in Self.deleteDestinations(config: config) {
+            guard destination.isAvailable else { continue }
+            let records = store.load(replicaID: destination.id)
             guard records.contains(where: { $0.relativePath == relativePath }) else { continue }
 
-            let trashRoot = self.trashRoot(replica.url)
+            let trashRoot = self.trashRoot(destination.root)
             var kept: [DeleteRecord] = []
             for record in records where record.relativePath == relativePath {
-                let trashURL = record.trashURL(onReplicaRoot: replica.url)
+                let trashURL = record.trashURL(onReplicaRoot: destination.root)
                 guard Self.isInside(trashURL, of: trashRoot) else { continue }
                 if fm.fileExists(atPath: trashURL.path), (try? fm.removeItem(at: trashURL)) == nil {
                     kept.append(record)
                 }
             }
             kept.append(contentsOf: records.filter { $0.relativePath != relativePath })
-            try? store.save(kept, for: replica.id)
+            try? store.save(kept, for: destination.id)
         }
     }
 
@@ -865,10 +896,12 @@ public actor MirrorEngine {
 
     /// Guard for every path derived from a record on disk: a hand-edited or corrupt record must
     /// never be able to point a delete or a restore outside the directory it belongs in.
+    ///
+    /// Compared canonically (`PathIdentity`), because a record holds the spelling the enumerator
+    /// produced while the configuration holds the spelling a person chose, and on macOS those differ
+    /// for anything under `/var` — the same directory under two names.
     static func isInside(_ child: URL, of root: URL) -> Bool {
-        let childPath = child.standardizedFileURL.path
-        let rootPath = root.standardizedFileURL.path
-        return childPath.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/")
+        PathIdentity.contains(root, child)
     }
 
     /// Where a restore may write: the absolute path recorded at deletion time, or the path
@@ -885,6 +918,12 @@ public actor MirrorEngine {
             let url = URL(fileURLWithPath: path)
             for source in config.sources where isInside(url, of: source.url) {
                 return (url, source)
+            }
+            // A two-way link's local folder is a legitimate place to put a file back, and the
+            // reconcile that follows publishes it to the vault again — which is what makes a
+            // restore here an undelete for every machine rather than a local-only fix.
+            for link in config.vaults where isInside(url, of: link.localURL) {
+                return (url, SourceRoot(id: link.id, name: link.displayName, path: link.localPath))
             }
         }
         return nil

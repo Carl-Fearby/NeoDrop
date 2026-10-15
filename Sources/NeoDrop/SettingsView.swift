@@ -13,6 +13,8 @@ struct SettingsView: View {
                 .tabItem { Label("Sources", systemImage: "folder") }
             ReplicasTab(model: model)
                 .tabItem { Label("Destinations", systemImage: "externaldrive") }
+            VaultsTab(model: model)
+                .tabItem { Label("Two-Way", systemImage: "arrow.left.arrow.right") }
             ActivityTab(model: model)
                 .tabItem { Label("Activity", systemImage: "list.bullet.rectangle") }
         }

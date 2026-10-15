@@ -63,17 +63,35 @@ public enum Scanner {
     /// Symbolic links are skipped: mirroring a symlink either duplicates data or creates a loop,
     /// and neither is what "the NAS has a copy of my files" should mean.
     public static func scan(source: SourceRoot, excludes: ExcludeMatcher) throws -> [ScannedFile] {
+        try scan(folder: source, excludes: excludes, includeHidden: false)
+    }
+
+    /// The same walk, with two knobs vault mode needs.
+    ///
+    /// `includeHidden` is off for a mirror and on for a vault: mirroring deliberately skips hidden
+    /// files, but a two-way tool that silently dropped `.env` or `.ssh` would be a trap, so those
+    /// sync. `hardSkips` names directories that must never be published or applied whatever the
+    /// user's exclude list says — the vault's own `.neodrop/` metadata and this machine's
+    /// `.neodrop-trash/`. Anything else would mean a tool that syncs its own bookkeeping.
+    public static func scan(
+        folder: SourceRoot,
+        excludes: ExcludeMatcher,
+        includeHidden: Bool,
+        hardSkips: Set<String> = []
+    ) throws -> [ScannedFile] {
         let fm = FileManager.default
-        let root = source.url
+        let root = folder.url
         guard fm.fileExists(atPath: root.path) else {
             throw ScannerError.sourceMissing(root.path)
         }
 
         let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey]
+        var options: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
+        if !includeHidden { options.insert(.skipsHiddenFiles) }
         guard let enumerator = fm.enumerator(
             at: root,
             includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles, .skipsPackageDescendants],
+            options: options,
             errorHandler: { _, _ in true }
         ) else {
             return []
@@ -88,6 +106,10 @@ public enum Scanner {
                 if values.isDirectory == true { enumerator.skipDescendants() }
                 continue
             }
+            if hardSkips.contains(name) {
+                if values.isDirectory == true { enumerator.skipDescendants() }
+                continue
+            }
             if values.isDirectory == true {
                 if excludes.matchesDirectory(named: name) { enumerator.skipDescendants() }
                 continue
@@ -98,7 +120,7 @@ public enum Scanner {
             if excludes.matches(fileName: name, relativePath: relative) { continue }
 
             results.append(ScannedFile(
-                sourceID: source.id,
+                sourceID: folder.id,
                 relativePath: relative,
                 url: url,
                 size: Int64(values.fileSize ?? 0),

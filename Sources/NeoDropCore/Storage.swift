@@ -25,6 +25,21 @@ public struct StorePaths: Sendable {
     public var manifestsDirectory: URL { base.appendingPathComponent("manifests", isDirectory: true) }
     public var locksDirectory: URL { base.appendingPathComponent("locks", isDirectory: true) }
     public var deletesDirectory: URL { base.appendingPathComponent("deletes", isDirectory: true) }
+    /// Per-vault, per-machine sync state (what this machine and the vault last agreed on).
+    public var vaultsDirectory: URL { base.appendingPathComponent("vaults", isDirectory: true) }
+    /// This machine's identity: the name it puts on the journal it writes and on conflicted copies.
+    public var machineURL: URL { base.appendingPathComponent("machine.json") }
+
+    public func vaultCursorURL(vaultID: UUID) -> URL {
+        vaultsDirectory.appendingPathComponent("\(vaultID.uuidString).json")
+    }
+
+    /// Files this machine has deliberately restored after another machine deleted them, which the
+    /// next reconcile must publish as new content rather than treat as a stale copy. Keyed by the
+    /// link id, like the deletion records it belongs beside.
+    public func vaultUndeleteURL(linkID: UUID) -> URL {
+        vaultsDirectory.appendingPathComponent("\(linkID.uuidString)-undeletes.json")
+    }
 
     public func manifestURL(for replicaID: UUID) -> URL {
         manifestsDirectory.appendingPathComponent("\(replicaID.uuidString).json")
@@ -32,7 +47,7 @@ public struct StorePaths: Sendable {
 
     public func ensureDirectories() throws {
         let fm = FileManager.default
-        for directory in [base, manifestsDirectory, locksDirectory, deletesDirectory] {
+        for directory in [base, manifestsDirectory, locksDirectory, deletesDirectory, vaultsDirectory] {
             try fm.createDirectory(at: directory, withIntermediateDirectories: true)
         }
     }

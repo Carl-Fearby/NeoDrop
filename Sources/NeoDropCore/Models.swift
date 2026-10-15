@@ -64,6 +64,9 @@ public struct AppConfig: Codable, Sendable {
     public var version: Int
     public var sources: [SourceRoot]
     public var replicas: [Replica]
+    /// Two-way folders: a local working copy paired with a vault on a share. A vault link is the
+    /// Dropbox-shaped mode; a replica is the one-way mirror. Both can live in one configuration.
+    public var vaults: [VaultLink]
     /// Watch the sources with FSEvents and sync shortly after anything changes.
     public var watchForChanges: Bool
     /// Run a sync on a timer even when nothing changed.
@@ -87,6 +90,7 @@ public struct AppConfig: Codable, Sendable {
         version: Int = 1,
         sources: [SourceRoot] = [],
         replicas: [Replica] = [],
+        vaults: [VaultLink] = [],
         watchForChanges: Bool = true,
         scheduledSync: Bool = true,
         syncIntervalMinutes: Int = 15,
@@ -100,6 +104,7 @@ public struct AppConfig: Codable, Sendable {
         self.version = version
         self.sources = sources
         self.replicas = replicas
+        self.vaults = vaults
         self.watchForChanges = watchForChanges
         self.scheduledSync = scheduledSync
         self.syncIntervalMinutes = syncIntervalMinutes
@@ -113,13 +118,45 @@ public struct AppConfig: Codable, Sendable {
 
     public static let defaultExcludes = [".DS_Store", "._*", ".Trash", "*.tmp", "*.part", ".neodrop-*"]
 
+    /// Decoded by hand so a key this build does not know about cannot make the whole file
+    /// unreadable. `JSONFile.load` turns a failed decode into "no configuration", and silently
+    /// forgetting every source and destination because a newer build wrote one extra field is far
+    /// worse than ignoring that field.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        sources = try container.decodeIfPresent([SourceRoot].self, forKey: .sources) ?? []
+        replicas = try container.decodeIfPresent([Replica].self, forKey: .replicas) ?? []
+        vaults = try container.decodeIfPresent([VaultLink].self, forKey: .vaults) ?? []
+        watchForChanges = try container.decodeIfPresent(Bool.self, forKey: .watchForChanges) ?? true
+        scheduledSync = try container.decodeIfPresent(Bool.self, forKey: .scheduledSync) ?? true
+        syncIntervalMinutes = try container.decodeIfPresent(Int.self, forKey: .syncIntervalMinutes) ?? 15
+        scheduledVerify = try container.decodeIfPresent(Bool.self, forKey: .scheduledVerify) ?? true
+        verifyIntervalHours = try container.decodeIfPresent(Int.self, forKey: .verifyIntervalHours) ?? 24
+        verifyAfterCopy = try container.decodeIfPresent(Bool.self, forKey: .verifyAfterCopy) ?? true
+        mirrorDeletions = try container.decodeIfPresent(Bool.self, forKey: .mirrorDeletions) ?? true
+        allowBulkDeletions = try container.decodeIfPresent(Bool.self, forKey: .allowBulkDeletions) ?? false
+        excludes = try container.decodeIfPresent([String].self, forKey: .excludes) ?? AppConfig.defaultExcludes
+    }
+
     public var enabledReplicas: [Replica] {
         replicas.filter(\.enabled).sorted { $0.priority < $1.priority }
     }
 
-    public var isConfigured: Bool { !sources.isEmpty && !enabledReplicas.isEmpty }
+    public var enabledVaults: [VaultLink] { vaults.filter(\.enabled) }
+
+    /// A configuration with at least one kind of destination set up. Either mode alone is enough:
+    /// a vault-only setup is a complete Dropbox-shaped configuration and must not be told it is
+    /// unconfigured because it has no mirror.
+    public var isConfigured: Bool { hasMirrors || hasVaults }
+
+    public var hasMirrors: Bool { !sources.isEmpty && !enabledReplicas.isEmpty }
+
+    public var hasVaults: Bool { !enabledVaults.isEmpty }
 
     public func replica(id: UUID) -> Replica? { replicas.first { $0.id == id } }
+
+    public func vault(id: UUID) -> VaultLink? { vaults.first { $0.id == id } }
 }
 
 // MARK: - Manifest

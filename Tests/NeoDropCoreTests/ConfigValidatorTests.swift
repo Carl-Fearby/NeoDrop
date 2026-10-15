@@ -112,4 +112,97 @@ final class ConfigValidatorTests: XCTestCase {
         // Every replica in the sandbox is on the boot volume, which should be called out.
         XCTAssertTrue(messages(sandbox.config()).contains { $0.contains("boot disk") })
     }
+
+    // MARK: - Two-way folders
+
+    private func vaultSandbox() throws -> (local: URL, vault: URL) {
+        let local = sandbox.root.appendingPathComponent("TwoWay/Folder")
+        let vault = sandbox.root.appendingPathComponent("NAS/Vault")
+        for url in [local, vault] {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        }
+        return (local, vault)
+    }
+
+    /// A vault-only configuration is complete. Telling someone with no mirror that they have no
+    /// NAS destination would be wrong twice over: nothing is missing, and the sync would refuse to run.
+    func testAVaultAloneHasNoErrors() throws {
+        let (local, vault) = try vaultSandbox()
+        let config = AppConfig(vaults: [VaultLink(vaultPath: vault.path, localPath: local.path)])
+
+        XCTAssertEqual(errors(config), [])
+        XCTAssertTrue(config.isConfigured)
+    }
+
+    func testVaultNestedInsideItsLocalFolderIsAnError() throws {
+        let (local, _) = try vaultSandbox()
+        let config = AppConfig(vaults: [VaultLink(vaultPath: local.appendingPathComponent("Vault").path, localPath: local.path)])
+
+        XCTAssertTrue(errors(config).contains { $0.contains("nested inside one another") })
+    }
+
+    func testMissingVaultIsAnError() throws {
+        let (local, _) = try vaultSandbox()
+        let config = AppConfig(vaults: [VaultLink(vaultPath: "/Volumes/neodrop-missing-\(UUID().uuidString)", localPath: local.path)])
+
+        XCTAssertTrue(errors(config).contains { $0.contains("vault") && $0.contains("is not mounted") })
+    }
+
+    func testMissingLocalFolderIsAnError() throws {
+        let (_, vault) = try vaultSandbox()
+        let config = AppConfig(vaults: [VaultLink(
+            vaultPath: vault.path,
+            localPath: sandbox.root.appendingPathComponent("gone-\(UUID().uuidString)").path
+        )])
+
+        XCTAssertTrue(errors(config).contains { $0.contains("is not available") })
+    }
+
+    func testTwoVaultsPointingAtOneVaultAreAnError() throws {
+        let (local, vault) = try vaultSandbox()
+        let second = sandbox.root.appendingPathComponent("TwoWay/Second")
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+
+        let config = AppConfig(vaults: [
+            VaultLink(vaultPath: vault.path, localPath: local.path),
+            VaultLink(vaultPath: vault.path, localPath: second.path),
+        ])
+
+        XCTAssertTrue(errors(config).contains { $0.contains("point at the same vault") })
+    }
+
+    func testTwoVaultsSyncingOneFolderAreAnError() throws {
+        let (local, vault) = try vaultSandbox()
+        let other = sandbox.root.appendingPathComponent("NAS/Vault2")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+
+        let config = AppConfig(vaults: [
+            VaultLink(vaultPath: vault.path, localPath: local.path),
+            VaultLink(vaultPath: other.path, localPath: local.path),
+        ])
+
+        XCTAssertTrue(errors(config).contains { $0.contains("both sync the folder") })
+    }
+
+    func testVaultInsideAReplicaIsAWarning() throws {
+        let (local, _) = try vaultSandbox()
+        let vault = sandbox.replicaURLs[0].appendingPathComponent("Vault")
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+
+        var config = sandbox.config()
+        config.vaults = [VaultLink(vaultPath: vault.path, localPath: local.path)]
+
+        XCTAssertTrue(messages(config).contains { $0.contains("inside replica") })
+    }
+
+    func testADisabledVaultIsNotChecked() throws {
+        let (local, _) = try vaultSandbox()
+        let config = AppConfig(vaults: [VaultLink(
+            vaultPath: "/Volumes/neodrop-missing-\(UUID().uuidString)",
+            localPath: local.path,
+            enabled: false
+        )])
+
+        XCTAssertFalse(errors(config).contains { $0.contains("is not mounted") })
+    }
 }
