@@ -96,6 +96,12 @@ extension FinderStatusIndex {
             for corrupt in manifest.corruptPaths {
                 index.merge(.attention, forPath: replica.url.appendingPathComponent(corrupt).path)
             }
+            // Something sitting where the mirror wants a file, which NeoDrop will not replace. This
+            // is the last word on it — the file is not tracked, so nothing else in the index has an
+            // opinion about it, and a question mark is exactly what it deserves.
+            for foreign in manifest.foreignPaths {
+                index.merge(.foreign, forPath: replica.url.appendingPathComponent(foreign).path)
+            }
 
             // One entry per destination, not per retained file: an exception may name a directory and
             // then covers everything below it, which is what keeps a long trash list out of the file.

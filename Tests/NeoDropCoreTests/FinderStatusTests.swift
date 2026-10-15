@@ -141,21 +141,76 @@ final class FinderStatusTests: XCTestCase {
         XCTAssertEqual(appSide.lastPathComponent, extensionSide.lastPathComponent)
     }
 
-    /// Publishing works on a Mac where the extension has not run yet: on first launch the app is
-    /// started by the user and Finder gets round to the extension later, so the write must carry on
-    /// regardless. `save` creates the directory it needs, which means this is the only test that
-    /// touches a path outside its sandbox — and it is the real one the installed extension reads, so
-    /// the file is removed again rather than left to publish a scratch folder's badge state.
-    func testPublishingCreatesTheContainerDirectoryWhenTheExtensionHasNeverRun() throws {
-        let url = FinderStatusIndex.extensionContainerIndexURL()
+    /// Publishing works on a Mac where the badge directory does not exist yet: on first launch the
+    /// app is started by the user and Finder gets round to the extension later, so the write has to
+    /// carry on regardless. `save` creates the directories it needs.
+    ///
+    /// A scratch directory stands in for the container here on purpose — the real one is a matter of
+    /// signatures rather than of code, and the test below is where that is asserted.
+    func testPublishingCreatesTheDirectoryItNeeds() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("neodrop-badge-\(UUID().uuidString)", isDirectory: true)
+        let url = directory
+            .appendingPathComponent(FinderStatusIndex.badgesDirectoryName, isDirectory: true)
+            .appendingPathComponent(FinderStatusIndex.fileName)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
         let index = FinderStatusIndex(roots: [FinderRoot(path: sandbox.source.path, name: "Source", kind: .source)])
         try index.save(to: url)
-        defer { try? FileManager.default.removeItem(at: url) }
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path),
-                      "save created the container directory and wrote the index into it")
+                      "save created the directories and wrote the index into them")
         XCTAssertEqual(FinderStatusIndex.load(from: url)?.roots, index.roots,
-                       "and the extension reads back exactly what was published")
+                       "and the other side reads back exactly what was published")
+    }
+
+    /// The real container, which is where the installed extension actually reads from.
+    ///
+    /// Measured on macOS 26: since macOS 14 an application data container is protected from
+    /// processes outside the team that owns it, so this publish succeeds when the app and the
+    /// extension are signed by one team and is refused with a clean permission error when they are
+    /// not. An ad-hoc signature has no team at all, which is what a `swift test` run looks like — so
+    /// both outcomes are asserted instead of the environment being assumed.
+    ///
+    /// Falling into the refusal branch is not a defect in the code: the app must carry on either way
+    /// (`AppModel.publishFinderStatus` catches this and logs it, because a badge going stale must never
+    /// stop a sync), and the half that fixes it is a signature. `scripts/verify.sh` fails a build whose
+    /// two bundles are signed by *different* teams, which is the case that can happen by accident.
+    func testTheContainerChannelWorksForTheOwningTeamAndIsRefusedOtherwise() throws {
+        let url = FinderStatusIndex.extensionContainerIndexURL()
+        let index = FinderStatusIndex(roots: [FinderRoot(path: sandbox.source.path, name: "Source", kind: .source)])
+
+        do {
+            try index.save(to: url)
+            // Only the file is removed: the container directory belongs to macOS and cannot be (and
+            // should not be) deleted from here.
+            defer { try? FileManager.default.removeItem(at: url) }
+            XCTAssertEqual(FinderStatusIndex.load(from: url)?.roots, index.roots,
+                           "a team-signed app publishes into the container and the extension reads it back")
+        } catch {
+            let failure = error as NSError
+            XCTAssertEqual(failure.domain, NSCocoaErrorDomain,
+                           "the refusal is a file error the app can catch and log, not a crash: \(error)")
+            XCTAssertEqual(failure.code, NSFileWriteNoPermissionError,
+                           "expected the container to refuse this process's signature, got \(failure.code): \(error)")
+        }
+    }
+
+    /// A file NeoDrop will not replace gets the question mark. It is on a destination, it is not
+    /// NeoDrop's, and — because nothing else in the index has an opinion about an untracked path —
+    /// this is the only thing that could badge it at all. Without it a hand-placed file looks like a
+    /// file nobody asked about, which is the wrong answer to "is this safe?".
+    func testAFileNeoDropDidNotWriteIsBadgedAsForeign() async throws {
+        try sandbox.write("ours", to: "report.txt")
+        let inTheWay = sandbox.replicaURLs[0].appendingPathComponent("report.txt")
+        try "theirs".write(to: inTheWay, atomically: true, encoding: .utf8)
+        _ = await sandbox.engine().sync(config: sandbox.config())
+
+        let index = build()
+        XCTAssertEqual(index.badge(for: inTheWay.path), .foreign)
+        XCTAssertEqual(index.badge(for: sandbox.replicaURLs[1]
+            .appendingPathComponent("report.txt").path), .synced,
+                       "the replica that did receive the file is in sync, as usual")
     }
 
     // MARK: - What the app publishes

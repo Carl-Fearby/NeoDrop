@@ -131,7 +131,9 @@ check "signature validates strictly" "codesign --verify --strict '$APP'"
 #     the system log only);
 #   * a sandboxed extension cannot read the app's Application Support directory, so without a channel
 #     it registers, runs and badges nothing. The channel is the extension's own container, which the
-#     app writes from outside. An App Group is *not* it: `~/Library/Group Containers` is closed to a
+#     app writes from outside — and which macOS 14+ closes to any process outside the *team* that owns
+#     it, so an ad-hoc signed app is refused ("You don't have permission to save the file …") and the
+#     badges stay dark. An App Group is *not* the channel: `~/Library/Group Containers` is closed to a
 #     non-sandboxed process, so an app-group entitlement makes the app look entitled while the index
 #     never lands — the checks below refuse it rather than leave that to be rediscovered;
 #   * a plist naming a class the binary does not export gives an extension that loads and does
@@ -160,6 +162,20 @@ check "Finder extension is a single architecture or fat, never empty" \
 check "the extension exports the class the plist names" \
   "[[ \"\$(strings -a '$EXTENSION_BINARY')\" == *NeoDropFinderExtension* ]]"
 check "Finder extension is signed" "codesign --verify --strict '$APPEX'"
+# One team, or no badges. A container is protected from processes outside the team that owns it, so
+# the app and the extension have to carry the *same* team identifier for anything the app publishes to
+# reach the extension. Both ad-hoc (no team at all) is the supported build for somebody without an
+# Apple account and is reported as a note with its consequence; two different teams is a failure,
+# because that combination builds, launches, syncs — and can never publish a badge.
+APP_TEAM="$(codesign -dvv "$APP" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2}')"
+EXTENSION_TEAM="$(codesign -dvv "$APPEX" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2}')"
+if [ "$APP_TEAM" = "not set" ] && [ "$EXTENSION_TEAM" = "not set" ]; then
+  note "signed ad-hoc: no team, so macOS 14+ refuses the app's writes into the extension's container and the badges stay dark (build with MACOS_SIGN_IDENTITY to switch them on)"
+elif [ "$APP_TEAM" = "$EXTENSION_TEAM" ]; then
+  pass "app and extension share a team ($APP_TEAM), so the badge index can reach the extension"
+else
+  fail "app is signed by '$APP_TEAM' and the extension by '$EXTENSION_TEAM': a container is closed to another team, so no badge can ever be published"
+fi
 # Entitlements in the signature are what PlugInKit reads before it will register the extension.
 # They only land there for an MH_EXECUTE, which is why the shape of the binary above matters.
 check "Finder extension carries the App Sandbox entitlement PlugInKit requires" \

@@ -135,6 +135,99 @@ final class MirrorEngineTests: XCTestCase {
         XCTAssertFalse(sandbox.fileExistsOnReplica(0, "alpha.txt"))
     }
 
+    /// A mirror that already holds the source's exact bytes is NeoDrop's own copy with a lost
+    /// manifest: a reset, a new Mac pointed at an existing share, a state directory restored from a
+    /// backup. Adopting what is there is what makes the clean-install instructions true — the next
+    /// sync recognises the files instead of uploading a whole library over the network again.
+    func testAFileAlreadyOnTheShareWithTheSourcesBytesIsAdoptedInsteadOfUploaded() async throws {
+        try sandbox.write("alpha", to: "alpha.txt")
+        _ = try await unwrap(await sandbox.engine().sync(config: sandbox.config()))
+
+        // A second Mac: the same folders, and no state of its own.
+        let freshPaths = StorePaths(base: sandbox.root.appendingPathComponent("fresh-state"))
+        try freshPaths.ensureDirectories()
+        let fresh = MirrorEngine(paths: freshPaths)
+
+        let untouched = sandbox.replicaURLs[0].appendingPathComponent("alpha.txt")
+        let before = try FileMeta.modificationDate(ofFileAt: untouched)
+        let summary = try await unwrap(await fresh.sync(config: sandbox.config()))
+
+        XCTAssertEqual(summary.filesAdopted, 2, "both replicas already held the file")
+        XCTAssertEqual(summary.filesCopied, 0, "nothing needed uploading")
+        XCTAssertEqual(summary.filesAdopted > 0 && summary.filesCopied == 0, true)
+        XCTAssertEqual(try sandbox.contentsOnReplica(0, "alpha.txt"), "alpha")
+        XCTAssertEqual(try FileMeta.modificationDate(ofFileAt: untouched), before,
+                       "the file on the share was not rewritten")
+
+        // And the next sync treats it as its own: up to date, nothing copied, no exceptions.
+        let second = try await unwrap(await fresh.sync(config: sandbox.config()))
+        XCTAssertEqual(second.filesCopied, 0)
+        XCTAssertEqual(second.replicas.map(\.foreign), [0, 0])
+        XCTAssertEqual(second.replicas.map(\.upToDate), [1, 1])
+    }
+
+    /// The one operation in the engine that could destroy a file existing nowhere else: something is
+    /// at a path the mirror wants, and NeoDrop has no record of ever writing it. It is left exactly
+    /// as it is — byte for byte — reported, and badged; the path becomes NeoDrop's the moment the
+    /// file is out of the way, which is the user's decision to make.
+    func testAFileNeoDropDidNotWriteIsNeverReplaced() async throws {
+        try sandbox.write("ours", to: "report.txt")
+        let theirs = "somebody else's afternoon of work"
+        let inTheWay = sandbox.replicaURLs[0].appendingPathComponent("report.txt")
+        try theirs.write(to: inTheWay, atomically: true, encoding: .utf8)
+
+        let engine = sandbox.engine()
+        let first = try await unwrap(await engine.sync(config: sandbox.config()))
+
+        XCTAssertEqual(try sandbox.contentsOnReplica(0, "report.txt"), theirs,
+                       "another file at the same path is not NeoDrop's to replace")
+        XCTAssertEqual(first.replicas[0].foreign, 1)
+        XCTAssertEqual(first.replicas[1].copied, 1, "the other replica still mirrors the source")
+        XCTAssertTrue(first.replicas[0].errors.contains { $0.contains("report.txt") },
+                      "and the run says which file it left alone")
+        XCTAssertTrue(first.filesCopied > 0 || first.filesAdopted > 0)
+
+        let manifest = ManifestStore(paths: sandbox.storePaths).load(replicaID: sandbox.replicaModels[0].id)
+        XCTAssertEqual(manifest.foreignPaths, ["report.txt"], "recorded, so the badge can name it")
+        XCTAssertNil(manifest.entries["report.txt"], "and not claimed as NeoDrop's")
+
+        // Another sync does not change its mind about somebody else's file.
+        let second = try await unwrap(await engine.sync(config: sandbox.config()))
+        XCTAssertEqual(try sandbox.contentsOnReplica(0, "report.txt"), theirs)
+        XCTAssertEqual(second.replicas[0].foreign, 1)
+
+        // Once it is gone, the mirror takes the path — and forgets the exception.
+        try FileManager.default.removeItem(at: inTheWay)
+        _ = try await unwrap(await engine.sync(config: sandbox.config()))
+        XCTAssertEqual(try sandbox.contentsOnReplica(0, "report.txt"), "ours")
+        XCTAssertEqual(ManifestStore(paths: sandbox.storePaths)
+            .load(replicaID: sandbox.replicaModels[0].id).foreignPaths, [])
+    }
+
+    /// Manifests gain keys as the engine grows, and `ManifestStore.load` cannot tell an older file
+    /// from a damaged one: both come back empty, which on a share means uploading everything again.
+    /// A manifest written before `foreignPaths` existed therefore has to load with its entries intact.
+    func testAManifestFromAnOlderBuildKeepsItsEntries() throws {
+        let replica = sandbox.replicaModels[0]
+        let json = """
+        {
+          "replicaID": "\(replica.id.uuidString)",
+          "entries": { "alpha.txt": { "size": 5, "mtime": "2026-01-01T00:00:00Z", "sha256": "abc",
+                                     "writtenAt": "2026-01-01T00:00:00Z" } },
+          "lastSync": "2026-01-01T00:00:00Z",
+          "corruptPaths": ["beta.txt"]
+        }
+        """
+        let url = sandbox.storePaths.manifestURL(for: replica.id)
+        try Data(json.utf8).write(to: url)
+
+        let loaded = ManifestStore(paths: sandbox.storePaths).load(replicaID: replica.id)
+        XCTAssertEqual(loaded.entries.count, 1, "the entries survived the missing key")
+        XCTAssertEqual(loaded.entries["alpha.txt"]?.sha256, "abc")
+        XCTAssertEqual(loaded.corruptPaths, ["beta.txt"])
+        XCTAssertEqual(loaded.foreignPaths, [], "and the new key is simply empty")
+    }
+
     /// The guard that matters most: a source that has been renamed, unplugged or re-pointed must
     /// not cause the mirror to be emptied.
     func testBulkDeletionIsRefusedByDefault() async throws {

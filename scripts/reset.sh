@@ -139,8 +139,17 @@ fi
 if [ -z "$BADGE_INDEX" ]; then
   note "the real installation's Finder badge index (this is a NEODROP_HOME installation)"
 elif [ -f "$BADGE_INDEX" ]; then
-  plan "$BADGE_INDEX  (what Finder badges, from the folders above)"
-  REMOVALS+=("$BADGE_INDEX")
+  # It sits inside the extension's sandbox container, which is macOS's, not ours: measured on
+  # macOS 26, a process outside that container cannot create, delete or even list inside it — every
+  # attempt comes back "Operation not permitted". `[ -w ]` asks the kernel the same question the
+  # removal would, without changing anything, which is what a dry run has to do; without it this
+  # script would promise a removal it cannot make and then report a failure that is not one.
+  if [ -w "$(dirname "$BADGE_INDEX")" ]; then
+    plan "$BADGE_INDEX  (what Finder badges, from the folders above)"
+    REMOVALS+=("$BADGE_INDEX")
+  else
+    keep "$BADGE_INDEX  — inside the extension's sandbox container, which macOS refuses writes from outside: it survives this reset, and Finder can keep badging the old folders until the app publishes again"
+  fi
 else
   note "no Finder badge index (nothing is badged yet)"
 fi

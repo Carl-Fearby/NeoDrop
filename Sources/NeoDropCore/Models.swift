@@ -207,14 +207,40 @@ public struct Manifest: Codable, Sendable {
     public var lastVerify: Date?
     /// Paths that failed verification, retained so the menu can warn about them.
     public var corruptPaths: [String]
+    /// Paths where something sits that NeoDrop did not write and therefore will not replace,
+    /// retained so the Finder badge and the report can name them. Emptied as soon as every such
+    /// path is NeoDrop's again (usually because the user moved their file aside).
+    public var foreignPaths: [String]
 
     public init(replicaID: UUID, entries: [String: ManifestEntry] = [:], lastSync: Date? = nil,
-                lastVerify: Date? = nil, corruptPaths: [String] = []) {
+                lastVerify: Date? = nil, corruptPaths: [String] = [], foreignPaths: [String] = []) {
         self.replicaID = replicaID
         self.entries = entries
         self.lastSync = lastSync
         self.lastVerify = lastVerify
         self.corruptPaths = corruptPaths
+        self.foreignPaths = foreignPaths
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case replicaID, entries, lastSync, lastVerify, corruptPaths, foreignPaths
+    }
+
+    /// Decode with defaults for keys an older build never wrote.
+    ///
+    /// The synthesized decoder throws on a missing key, and `ManifestStore.load` cannot tell “this
+    /// file came from an older version” from “this file is damaged”: both come back as an empty
+    /// manifest, which on a share means uploading every file again. So keys added after the first
+    /// release are optional on the way in — `corruptPaths`, and now `foreignPaths`. Encoding is
+    /// unchanged, and a test holds the old-file case (`testAManifestFromAnOlderBuildKeepsItsEntries`).
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.replicaID = try container.decode(UUID.self, forKey: .replicaID)
+        self.entries = try container.decodeIfPresent([String: ManifestEntry].self, forKey: .entries) ?? [:]
+        self.lastSync = try container.decodeIfPresent(Date.self, forKey: .lastSync)
+        self.lastVerify = try container.decodeIfPresent(Date.self, forKey: .lastVerify)
+        self.corruptPaths = try container.decodeIfPresent([String].self, forKey: .corruptPaths) ?? []
+        self.foreignPaths = try container.decodeIfPresent([String].self, forKey: .foreignPaths) ?? []
     }
 
     public var totalBytes: Int64 { entries.values.reduce(0) { $0 + $1.size } }
@@ -461,6 +487,13 @@ public struct ReplicaReport: Sendable, Identifiable {
     public var repaired: Int
     public var corrupt: Int
     public var failed: Int
+    /// Files that were already on the replica with the source's exact bytes, so they were recorded
+    /// rather than uploaded again. This is the manifest having been lost (a reset, a new Mac), not a
+    /// normal sync.
+    public var adopted: Int
+    /// Files NeoDrop did not write and will not replace. Something else is at a path the mirror
+    /// wants, and it is left exactly as it is.
+    public var foreign: Int
     public var bytesWritten: Int64
     public var errors: [String]
 
@@ -475,6 +508,8 @@ public struct ReplicaReport: Sendable, Identifiable {
         repaired: Int = 0,
         corrupt: Int = 0,
         failed: Int = 0,
+        adopted: Int = 0,
+        foreign: Int = 0,
         bytesWritten: Int64 = 0,
         errors: [String] = []
     ) {
@@ -488,6 +523,8 @@ public struct ReplicaReport: Sendable, Identifiable {
         self.repaired = repaired
         self.corrupt = corrupt
         self.failed = failed
+        self.adopted = adopted
+        self.foreign = foreign
         self.bytesWritten = bytesWritten
         self.errors = errors
     }
@@ -514,6 +551,11 @@ public struct SyncSummary: Sendable {
     public var filesCopied: Int { replicas.reduce(0) { $0 + $1.copied + $1.updated } }
     public var filesRepaired: Int { replicas.reduce(0) { $0 + $1.repaired } }
     public var filesDeleted: Int { replicas.reduce(0) { $0 + $1.deleted } }
+    /// Files that were already on a replica with the source's exact bytes and were recorded rather
+    /// than uploaded — the manifest having been lost, not a normal sync.
+    public var filesAdopted: Int { replicas.reduce(0) { $0 + $1.adopted } }
+    /// Files left alone because they are not NeoDrop's to replace.
+    public var foreignFiles: Int { replicas.reduce(0) { $0 + $1.foreign } }
     public var bytesWritten: Int64 { replicas.reduce(0) { $0 + $1.bytesWritten } }
     public var failures: Int { replicas.reduce(0) { $0 + $1.failed } }
 

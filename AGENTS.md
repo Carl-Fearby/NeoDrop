@@ -15,7 +15,7 @@ server and no cloud component.
 
 ```bash
 swift build                                        # compile everything
-swift test                                         # 187 engine tests: 186 green, one failing on purpose
+swift test                                         # 193 engine tests, all green
 swift run NeoDrop                                  # run the app (menu bar icon)
 swift build -c release --show-bin-path             # locate the release binary
 scripts/package.sh [--arch universal] [--no-dmg]   # .app + DMG, ad-hoc signed by default
@@ -24,6 +24,8 @@ scripts/e2e.sh [--keep]                            # drive the packaged app agai
 scripts/e2e-vault.sh [--keep]                      # two real installs, one vault: both directions
 scripts/install.sh [--app path] [--no-enable]      # into /Applications + enable the Finder extension
 scripts/reset.sh [--yes] [--trash] [--app]         # clean-install: state only, dry run by default
+scripts/uninstall.sh [--yes] [--keep-app|--keep-state] [--trash] [--app path]
+                                                   # the other direction: app + Finder extension + state
 scripts/fake-nas.sh create 3 | destroy | list      # real mounted volumes to test against
 swift scripts/make-icon.swift build/NeoDrop.icns --source Resources/AppIcon.png --verify
 swift scripts/verify-menubar-icon.swift                        # menu bar template icon checks
@@ -92,7 +94,21 @@ behaviour, change the test only with a written reason.
 16. **A config file that fails to decode must never be treated as an empty configuration.**
     `AppConfig` decodes by hand with defaults for missing keys, so an older file (no `vaults`) or a
     newer key loads rather than silently forgetting every source and destination
-    (`testDecodesAConfigWrittenBeforeVaultsExisted`).
+    (`testDecodesAConfigWrittenBeforeVaultsExisted`). `Manifest` does the same for the same reason:
+    `ManifestStore.load` turns a decode failure into an empty manifest, which on a share means
+    uploading every file again (`testAManifestFromAnOlderBuildKeepsItsEntries`).
+17. **A file NeoDrop did not write is never replaced.** Something else at a path the mirror wants is
+    left exactly as it is — byte for byte — reported in the run's summary, and recorded in
+    `Manifest.foreignPaths` so the Finder extension can badge it as `foreign`
+    (`testAFileNeoDropDidNotWriteIsNeverReplaced`, `testAFileNeoDropDidNotWriteIsBadgedAsForeign`).
+    This is the one copy that could destroy a file existing nowhere else, so the mirror gives up the
+    path instead, and the next sync takes it once the file is out of the way. The same check is where
+    a *lost manifest* is noticed: a file already carrying the source's exact bytes is **adopted** into
+    the manifest rather than uploaded again — same size first, and only then a hash
+    (`testAFileAlreadyOnTheShareWithTheSourcesBytesIsAdoptedInsteadOfUploaded`). That is what makes the
+    clean-install instructions true, and what stops a fresh install from re-uploading a whole library.
+    `scripts/e2e.sh` stages the real thing: a file put on NAS1 by hand at a path the source then gains,
+    checked byte for byte after the app's own sync.
 
 ## Two-way sync (`Vault.swift`, `VaultSync.swift`)
 
@@ -281,12 +297,13 @@ logged anywhere obvious. They are worth knowing before touching `scripts/package
    Containers` is closed to the unsandboxed app (EPERM writing into one, with an ad-hoc signature and
    with an Apple Development certificate alike — "You don't have permission to save the file … in the
    folder group.…"), and a sandboxed process is refused too when the container was created by another
-   bundle. A container's own `Data` directory is an ordinary directory owned by the user, so the app
-   writes it from outside and the sandboxed extension reads it as its home. `FinderStatusIndex`
-   spells both sides out (`extensionIndexURL` for the extension, `extensionContainerIndexURL` for the
-   app), a unit test holds them together, `scripts/verify.sh` refuses an App Group in either
-   entitlement file and checks the app names the container of the extension it ships, and
-   `scripts/e2e.sh` asserts the packaged app actually publishes there.
+   bundle. A container is where the two processes meet, but only when both bundles carry the same team
+   identity — that is the second half of this, measured below, and it is why an ad-hoc build badges
+   nothing. `FinderStatusIndex` spells both sides out (`extensionIndexURL` for the extension,
+   `extensionContainerIndexURL` for the app), a unit test holds them together, `scripts/verify.sh`
+   refuses an App Group in either entitlement file, checks the app names the container of the extension
+   it ships and compares the two team identifiers, and `scripts/e2e.sh` asserts the packaged app
+   actually publishes there when LaunchServices starts it.
 
 Inside, everything is a lookup: `FinderStatusIndex` is a small JSON file of *exceptions* — paths
 whose badge is not "in sync" — plus the roots NeoDrop protects. `requestBadgeIdentifier` answers
@@ -297,15 +314,37 @@ hands it URLs and the index hands it badge identifiers.
 `NEODROP_HOME` is deliberately **not** honoured: the extension is registered once for the installed
 app, and a scratch installation is not what the Finder showing the user's files should be about.
 
-### Status: the badges work, the channel does not survive an app update
+### Status: the badge channel works, and needs a team signature
 
-**Known limitation, measured on macOS 26 after the badges were working end to end.** The app
+**Measured on macOS 26, and the channel was never the problem: the signature decides.** The app
 publishes the index into the extension's own container because that is the only path a sandboxed
-extension can read — and macOS *seals* that container once it has claimed it for the registered
-appex. Writing into it then fails with EPERM ("You don't have permission to save the file … in the
-folder NeoDrop") and the badges die silently. The seal tracks the appex identity, not the running
-process: it appeared when `install.sh` replaced the bundle, and it is still there with the extension
-quit.
+extension can read. Since macOS 14 that container is protected from processes outside the *team* that
+owns it — macOS asks before an app reaches another developer's data container, and apps signed by one
+Team ID may reach each other's by default — and an ad-hoc signature carries no team at all:
+
+* **ad-hoc** (this repo's default build, and everything `swift run` produces): every write is refused,
+  logged as `Finder badges could not be updated: You don't have permission to save the file
+  “.finder-status.json.tmp-…” in the folder “NeoDrop”` (NSCocoaErrorDomain 513). The app carries on —
+  `publishFinderStatus` catches and logs it, because a stale badge must never stop a sync — so the only
+  symptom is badges that never appear, which is what made this look like a channel problem.
+* **one team for both bundles** (`Apple Development: Carl Fearby`, team `JE22Z4DD8L`): `Finder badges
+  updated: 0 folder(s), 0 needing attention`, and the container's `finder-status.json` is rewritten at
+  launch (mtime == the launch second). `scripts/verify.sh` compares the two team identifiers and fails
+  a build where they differ; an ad-hoc build is a note, because building without an Apple account is
+  deliberate.
+
+The **launch path** is the second half, and it is easy to miss: the same binary publishes when
+LaunchServices starts it (`open -a`) and is refused when a shell starts it
+(`NEODROP_HOME=… build/NeoDrop.app/Contents/MacOS/NeoDrop`), because the responsible process for a
+shell-started run is the shell, which carries no team. `swift run NeoDrop` therefore never badges
+anything even with a team signature: install it and let Finder start it. `scripts/e2e.sh` checks the
+container half that way — its own instance is shell-launched, so it asserts the refusal there, and its
+last section starts the installed app through `open` and asserts the publish.
+
+Containers themselves are containermanagerd's, and nothing else removes one: `rm`, `mv`, Finder and
+even `sudo rm -rf` are all refused (`Operation not permitted` on
+`.com.apple.containermanagerd.metadata.plist`). That is why `reset.sh` reports the badge index as
+*kept* and `uninstall.sh` leaves the container behind with its reason printed.
 
 What a sandboxed extension can read, measured by logging from inside the extension itself:
 
@@ -323,20 +362,31 @@ observer installed, notification posted, nothing delivered). So there is current
 channel from the app to a Finder Sync extension: the extension must be sandboxed, the app cannot be
 (that is its whole job), and every readable location is either sealed or denied.
 
-`FinderStatusTests.testPublishingCreatesTheContainerDirectoryWhenTheExtensionHasNeverRun` is
-therefore **left failing on purpose**. It is the marker for this, it is honest about the platform,
-and it must not be weakened, skipped or deleted to make the suite green — the fix is a channel that
-can work, not a quieter assertion. The candidates, in order of promise:
+The marker test is gone, deliberately, and the reason is the point. It was left failing while the
+refusal looked like a platform wall with no way through. It is not a wall — it is a signature — so the
+test was asserting the wall rather than the rule, and keeping it would have gone on blaming macOS for
+something `MACOS_SIGN_IDENTITY` fixes. What replaced it asserts whichever case the machine is in:
+`FinderStatusTests.testTheContainerChannelWorksForTheOwningTeamAndIsRefusedOtherwise` publishes into
+the real container and, when that is refused, requires the refusal to be a clean
+`NSFileWriteNoPermissionError` rather than a crash, because the app has to keep syncing either way.
+The other half of the old test — the app publishing *before* the extension has ever run, which needs
+`save` to create the directory it needs — now runs against a scratch path in
+`testPublishingCreatesTheDirectoryItNeeds`, where it can be asserted rather than hoped for.
+
+What is still not built, and is the next real improvement:
 
 1. **An XPC Mach service.** The app registers `NSXPCListener(machServiceName:)` and the extension
-   connects with `com.apple.security.temporary-exception.mach-lookup.global-name`. No shared file at
-   all, and live updates; badges would need the app running, which for a menu bar app is the normal
-   case.
-2. **A sandboxed app.** With the app sandboxed too, a team-signed App Group works properly — but the
+   connects with `com.apple.security.temporary-exception.mach-lookup.global-name` (Apple DTS: fine for
+   direct distribution, awkward on the App Store). No shared file at all, live updates, and it works
+   regardless of signatures — the entitlement lives on the extension, not on a team identity.
+2. **A loopback HTTP channel.** The app already serves a page on loopback; with
+   `com.apple.security.network.client` on the extension and a port it can find, the extension could
+   pull the index. Apple DTS says local-network privacy does not apply to loopback. Untested here.
+3. **A sandboxed app.** With the app sandboxed too, a team-signed App Group works properly — but the
    app would then need user-selected bookmarks for every share, which changes the product.
-3. Anything that ships the index to the extension outside the sandbox, once one of the above is
-   proven. Do not resurrect the container-write path: it works on a fresh install and dies at the
-   first update, which is the worst way for it to fail.
+
+Do not go back to "it works on a fresh install and dies at the first update": that was the ad-hoc
+signature all along. A channel is not what has to be right here — a signature is.
 
 ## The installer DMG
 
@@ -436,11 +486,34 @@ Two things to know when writing these tests:
   start a second copy of the same bundle — and two machines is the point.
 
 `scripts/reset.sh` is the clean-install path and is a dry run unless given `--yes`. It removes the
-state directory, the preferences plist and the saved application state — and, with `NEODROP_HOME`
-set, only that installation's state directory, never the real one's preferences. It lists the
-folders in `config.json` as *not touched* before it does anything, and `--trash` moves the state to
-the Trash so a reset made by mistake can be undone. Any change that would let it delete a user's
-folder, or the vault's `.neodrop/` on a share, is a bug: the vault belongs to every machine.
+state directory, the preferences plist, the saved application state and the Finder badge index — and,
+with `NEODROP_HOME` set, only that installation's state directory, never the real one's preferences.
+It lists the folders in `config.json` as *not touched* before it does anything, and `--trash` moves
+the state to the Trash so a reset made by mistake can be undone. Any change that would let it delete
+a user's folder, or the vault's `.neodrop/` on a share, is a bug: the vault belongs to every machine.
+
+`scripts/uninstall.sh` is the other direction: the app, the Finder extension and the state, for
+somebody who is done with NeoDrop. It exists because none of those three go away together — the state
+is in Application Support, and PlugInKit goes on loading the extension into Finder after the bundle
+is in the Trash, from *any* copy it can see. Measured: with `/Applications/NeoDrop.app` removed and a
+second `/Applications/NeoDropTest.app` installed, `pluginkit -r` appeared to do nothing because the
+registration simply moved to the other copy. So it finds every bundle whose `CFBundleIdentifier` is
+NeoDrop's instead of trusting one path, prints the copies PlugInKit is loading from even when they are
+outside the locations it scans, deregisters while the bundle is still on disk (that is what
+`pluginkit -r` needs), unregisters the bundle with `lsregister -u`, removes the app and the
+`~/Library/Application Scripts/ai.storyteller.neodrop.finder/` directory macOS creates for the
+extension, and then hands the state to `reset.sh` rather than keeping a second list of it. Dry run
+unless given `--yes`, like the reset; exit 1 when something could not be removed.
+
+The extension's sandbox container is deliberately left behind, and the reason is in the measurements:
+on macOS 26 a process outside `~/Library/Containers/ai.storyteller.neodrop.finder` cannot create,
+delete or even list inside it — `Operation not permitted` for the app as well, which is what its log
+says at launch ("Finder badges could not be updated … You don't have permission to save the file").
+So the badge index survives an uninstall, and `reset.sh` reports it as *kept* rather than as a failure
+it cannot fix: it probes the directory with `[ -w ]`, which asks the kernel the same question the
+removal would without changing anything, so a dry run never promises a deletion that cannot happen.
+That sealing is the same one behind the badge limitation — see
+`FinderStatusTests.testPublishingCreatesTheContainerDirectoryWhenTheExtensionHasNeverRun`.
 
 `XCTUnwrap` takes an autoclosure and cannot contain `await`; use the local `unwrap(_:)` helper for
 async engine calls.

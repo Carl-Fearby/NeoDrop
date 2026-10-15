@@ -386,16 +386,57 @@ public actor MirrorEngine {
         let totalBytes = plan.files.values.reduce(Int64(0)) { $0 + $1.size }
         var doneBytes: Int64 = 0
         var doneFiles = 0
+        /// Paths where something else is sitting this run, for the manifest (the Finder badge and
+        /// the report both read it).
+        var foreign: [String] = []
 
         for (relativePath, file) in plan.files {
             doneFiles += 1
             let destination = replica.url.appendingPathComponent(relativePath)
+            let sizeOnReplica = FileMeta.size(ofFileAt: destination)
 
             if let entry = manifest.entries[relativePath],
                entry.sha256 == file.sha256,
                entry.size == file.size,
-               FileMeta.size(ofFileAt: destination) == file.size {
+               sizeOnReplica == file.size {
                 report.upToDate += 1
+                doneBytes += file.size
+                continue
+            }
+
+            // Something is already at this path and NeoDrop has no record of writing it. The bytes
+            // tell two very different situations apart, and getting this wrong loses data:
+            //
+            //   * identical to the source — the manifest is gone (a reset, a fresh install pointed at
+            //     an existing mirror, a state directory restored from a backup) and this is NeoDrop's
+            //     own copy. Adopt it: the mirror is already correct, and re-uploading a whole library
+            //     over a share at every clean install is exactly what the reset instructions promise
+            //     will not happen.
+            //   * different — it is somebody else's file, and a mirror must not replace it. This is
+            //     the one operation in the engine that can destroy a file that exists nowhere else
+            //     (the badges call it “Not written by NeoDrop”), so it is left exactly as it is and
+            //     reported. Moving or deleting it on the share is the user's decision, and the next
+            //     sync takes the path then.
+            //
+            // The size is read first because it costs nothing: only a same-size candidate is worth
+            // hashing, and a directory sitting where a file belongs (a size, but not a file's) is
+            // somebody else's too.
+            if manifest.entries[relativePath] == nil, let sizeOnReplica, !FileMeta.isDirectory(destination) {
+                if sizeOnReplica == file.size,
+                   let digest = try? Hashing.sha256(ofFileAt: destination), digest == file.sha256 {
+                    manifest.entries[relativePath] = ManifestEntry(
+                        size: file.size,
+                        mtime: file.mtime,
+                        sha256: file.sha256,
+                        verifiedAt: Date(),
+                        sourceID: file.sourceID
+                    )
+                    report.adopted += 1
+                    doneBytes += file.size
+                    continue
+                }
+                foreign.append(relativePath)
+                report.foreign += 1
                 doneBytes += file.size
                 continue
             }
@@ -432,7 +473,17 @@ public actor MirrorEngine {
 
         manifest.lastSync = Date()
         manifest.replicaID = replica.id
+        // Replaced rather than appended to: a path that is NeoDrop's again has stopped being an
+        // exception, and a stale entry would keep badging a file that is now perfectly in sync.
+        manifest.foreignPaths = foreign
         try? manifestStore.save(manifest)
+
+        if !foreign.isEmpty {
+            let named = foreign.sorted().prefix(3).joined(separator: ", ")
+            report.errors.append(
+                "\(foreign.count) file(s) on \(replica.displayName) were not written by NeoDrop and were left untouched: \(named)\(foreign.count > 3 ? ", …" : ""). Delete or move them on the share and the next sync will mirror there."
+            )
+        }
 
         report.errors.append(contentsOf: plan.errors)
         report.status = report.failed > 0 || !report.errors.isEmpty ? .degraded : .online

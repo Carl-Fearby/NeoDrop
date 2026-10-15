@@ -144,10 +144,14 @@ public struct FinderStatusIndex: Codable, Sendable {
     ///     signature *and* signed with an Apple Development certificate ("You don't have permission to
     ///     save the file … in the folder group.…"), and a sandboxed process is refused as well when the
     ///     container was created by another bundle. A badge index nothing can write is no badge index.
-    ///   * A container's own `Data` directory is **not** protected that way: it is an ordinary
-    ///     directory owned by the user, so the unsandboxed app can write it and the sandboxed extension
-    ///     reads it as its own home. Both orders work — the app may publish before the extension has
-    ///     ever run (it creates the directory), and an extension that starts later finds the file.
+    ///   * The container is where the two processes meet — **when they share a team identity**. Since
+    ///     macOS 14 a container is protected from processes outside the team that owns it, so an ad-hoc
+    ///     signature, which has no team at all, is refused with "You don't have permission to save the
+    ///     file …" and the badges stay dark. Measured on macOS 26: refused ad-hoc, published as soon as
+    ///     both bundles carried one Apple Development identity. The app also has to be started by
+    ///     LaunchServices rather than from a shell, because the check follows the responsible process —
+    ///     `swift run NeoDrop` therefore badges nothing even when signed. scripts/verify.sh fails a
+    ///     build whose two bundles disagree on the team; AGENTS.md has the log lines.
     ///
     /// Neither side needs an entitlement for this: the extension keeps the App Sandbox and nothing
     /// else, which is also the smallest thing it could be granted while still being registerable.
@@ -172,7 +176,8 @@ public struct FinderStatusIndex: Codable, Sendable {
     ///
     /// Nothing has to exist first: `save(to:)` creates the directory it needs, which is what lets the
     /// app publish before the extension has ever run. The container the extension creates for itself on
-    /// first launch is the same directory, so either order ends with the two processes agreeing.
+    /// first launch is the same directory, so either order ends with the two processes agreeing —
+    /// subject to the team identity above, which is what makes this call fail rather than the path.
     public static func extensionContainerIndexURL() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Containers", isDirectory: true)

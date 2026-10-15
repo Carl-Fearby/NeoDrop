@@ -686,6 +686,15 @@ final class AppModel: ObservableObject {
         var line = "\(result.phase == .finished ? "Done" : "Finished") in \(String(format: "%.1f", result.duration))s: "
         line += "\(result.filesCopied) copied, \(result.filesRepaired) repaired, \(result.filesDeleted) removed, "
         line += "\(result.failures) failed across \(result.replicas.count) replica(s)"
+        // Both of these are unusual enough to be worth naming, and silent when they are zero: the
+        // first says a manifest was missing (a reset or a new Mac), the second that somebody else's
+        // file is in the way and was deliberately left alone.
+        if result.filesAdopted > 0 {
+            line += ", \(result.filesAdopted) already on the share"
+        }
+        if result.foreignFiles > 0 {
+            line += ", \(result.foreignFiles) left alone (not written by NeoDrop)"
+        }
         NeoDropLog.shared.write(line, level: level)
         for failure in failures.prefix(5) {
             NeoDropLog.shared.write(failure, level: .warning)

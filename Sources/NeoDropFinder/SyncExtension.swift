@@ -10,8 +10,9 @@ import FinderSync
 /// enumeration to answer is a badge that makes the Finder stutter.
 ///
 /// It reads the index from its own sandbox container — the one place a sandboxed process may read,
-/// and where the app publishes it from outside (see `FinderStatusIndex.extensionIndexURL` for the
-/// measurements behind that, and for why an App Group cannot be used). It does not read the app's own
+/// and where the app publishes it from outside, provided the two bundles share a team identity (see
+/// `FinderStatusIndex.extensionIndexURL` for the measurements behind both, and for why an App Group
+/// cannot be used). It does not read the app's own
 /// state directory, which the sandbox would refuse anyway, and it does not follow `NEODROP_HOME`: the
 /// extension is registered once for the installed app, and a second installation (which the end-to-end
 /// scripts use) is not what the Finder showing the user's files should be about.

@@ -261,6 +261,13 @@ codesign --verify --strict --verbose=1 "$APP"
 
 if [ "$IDENTITY" = "-" ]; then
   info "ad-hoc signature: fine for this Mac, NOT accepted by Gatekeeper on other Macs"
+  # The badges are the second casualty, and a quieter one: macOS 14+ closes an app's data container to
+  # processes outside the team that owns it, and an ad-hoc signature carries no team at all, so the app
+  # is refused when it publishes the badge index into the extension's container. The app logs it
+  # ("Finder badges could not be updated …") and carries on, which is why it looks like a badge bug
+  # rather than a signing one. Signing both bundles with one identity is all it takes.
+  warn "ad-hoc signing also means no Finder badges: the app cannot write into the extension's container"
+  warn "  (macOS 14+ protects a container from other teams). Set MACOS_SIGN_IDENTITY to switch them on."
 fi
 
 # ---- optional notarization --------------------------------------------------------------------

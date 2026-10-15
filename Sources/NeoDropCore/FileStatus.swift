@@ -265,7 +265,12 @@ public struct FileStatusQuery: Sendable {
                                                    onDiskSize: size, onDiskMtime: modified) {
                     verdict = "⚠︎ This copy no longer matches what NeoDrop recorded (changed on the share, or partial)."
                 } else if entry == nil {
-                    verdict = "Present, but NeoDrop has no record of writing it — it did not come from this Mac."
+                    // Two ways to have no record of a file that is sitting there: a sync found it and
+                    // refused to replace it (recorded, so this is the answer that says what to do next),
+                    // or nothing has been synced to this path yet.
+                    verdict = manifest.foreignPaths.contains(rel)
+                        ? "Not NeoDrop's file: something else is at this path, so the mirror left it alone rather than replace it. Move or delete it on the share and the next sync will mirror here."
+                        : "Present, but NeoDrop has no record of writing it — it did not come from this Mac."
                 } else {
                     verdict = "A complete copy of what NeoDrop wrote."
                 }

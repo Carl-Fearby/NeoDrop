@@ -15,8 +15,12 @@
      entitled while the badge index silently never landed.
 
      What works instead, and needs no entitlement at all, is publishing the index into the extension's
-     own container (`FinderStatusIndex.extensionContainerIndexURL`): that directory is an ordinary
-     one owned by the user, so the app can write it and the sandboxed extension reads it as its home.
+     own container (`FinderStatusIndex.extensionContainerIndexURL`) — provided both bundles are signed
+     by one team. Since macOS 14 a container is protected from processes outside the team that owns
+     it, so an ad-hoc signature, which has no team at all, is refused with "You don't have permission
+     to save the file …" and the badges stay dark. Measured on macOS 26: refused ad-hoc, published the
+     moment both bundles carried one Apple Development identity. scripts/verify.sh fails a build whose
+     two bundles disagree on the team and notes an ad-hoc one.
 
      Add anything here only with a reason in a comment, and check scripts/verify.sh still passes: it
      refuses an App Group in this file, because it cannot work in a non-sandboxed app. -->

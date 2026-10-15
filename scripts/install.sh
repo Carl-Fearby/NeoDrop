@@ -98,8 +98,19 @@ pluginkit -e use -i "$EXTENSION_ID" >/dev/null 2>&1
 sleep 1
 STATUS="$(pluginkit -m -v -i "$EXTENSION_ID" 2>/dev/null | head -1)"
 
+# The badges are the quiet casualty of an ad-hoc signature: macOS 14+ protects an app's data container
+# from processes outside the team that owns it, and ad-hoc carries no team, so the app is refused when
+# it publishes the badge index into the extension's container. The app logs it and syncs on, so the
+# only symptom is badges that never appear — which is worth saying out loud here, where somebody has
+# just enabled the extension and is about to go looking for them.
+TEAM="$(codesign -dvv "$DESTINATION" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2}')"
 if printf '%s' "$STATUS" | grep -q '^+'; then
   ok "Finder extension enabled: $STATUS"
+  if [ "$TEAM" = "not set" ]; then
+    note "signed ad-hoc, so no badge can reach the extension: build with MACOS_SIGN_IDENTITY set to an Apple Development or Developer ID identity, then reinstall"
+  else
+    note "app and extension are signed by team $TEAM, so the badge index reaches the extension"
+  fi
   printf '\nBadges appear next to the date in Finder for the folders NeoDrop protects. Nothing to do\nuntil at least one folder is set up: the app offers the setup wizard on first launch.\n'
   exit 0
 fi

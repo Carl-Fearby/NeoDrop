@@ -134,6 +134,7 @@ all enforced in code and covered by tests:
 | Rule | Why |
 |---|---|
 | Only files NeoDrop wrote are ever deleted (tracked in a per-replica manifest) | A replica can share a volume with other data; foreign files are never touched |
+| A file NeoDrop did not write is never replaced, only refused and reported | A name collision in a shared folder is no reason to lose somebody's file: the copy on the share may exist nowhere else. A file that is already there with the source's exact bytes is *adopted* instead, which is what makes a clean install cheap |
 | A replica root must already exist — it is never created | An unmounted share would otherwise make `/Volumes/NAS2/NeoDrop` resolve to the boot disk, and you'd "mirror" onto your own SSD |
 | Deletions are refused when a source could not be read | A renamed or unplugged source folder must never be interpreted as "everything was deleted" |
 | More than 25% of a replica (or 25 files) deleted in one run is refused unless explicitly allowed | Stops the signature mirroring disaster: one bad sync empties the NAS |
@@ -157,7 +158,7 @@ reached for one does not stop the other.
 
 ```bash
 swift build                 # library + app
-swift test                  # 187 engine tests: 186 green, one failing on purpose (see the badges below)
+swift test                  # 193 engine tests, all green (the badge-container one asserts whichever case this Mac is in)
 swift run NeoDrop           # menu bar icon appears immediately (reads/writes ~/Library/Application Support/NeoDrop)
 ```
 
@@ -378,20 +379,30 @@ so the state is visible without opening anything.
 | Spinning arrows | NeoDrop is reading or writing this file right now | Only while a sync is running and the app has republished the index mid-run |
 | Orange triangle | A destination copy is missing or no longer matches the record — run **Verify & Repair** | A copy that was deleted or replaced by hand |
 | Trash | Bytes NeoDrop is deliberately holding after a deletion, recoverable from **Deleted Files…** | On a destination's `.neodrop-trash/` folder, not per retained file |
-| Question mark | On a destination but not written by NeoDrop: somebody put it there by hand, and NeoDrop will not delete or overwrite it | **Not yet** — the shape is defined, but nothing publishes it |
+| Question mark | On a destination but not written by NeoDrop: somebody put it there by hand, and NeoDrop will not delete or overwrite it | The only badge outside a protected folder — a sync found a file that is not NeoDrop's where the mirror wanted one, and left it alone |
 | Dash | Nothing to do with NeoDrop, inside a protected folder but matching an ignore pattern | **Not yet** — the shape is defined, but nothing publishes it |
 
 A file outside every protected folder gets no icon at all — a badge on everything would say nothing.
 A folder shows the worst of what is inside it, so one file needing attention is visible from the
 folder above. Right-click a file → **Show NeoDrop Status** for the full report (above).
 
-**Known limitation — the badges do not survive an app update yet.** The state reaches the extension
-through a file in its sandbox container, and macOS seals that container once it has claimed it for
-the installed extension, so replacing the app leaves the write failing and the badges quietly gone.
-The measurements, and the two channels that can work (an XPC Mach service from the app, or a
-sandboxed app with a team-signed App Group), are in AGENTS.md — along with the failing test that
-marks it. Everything else here is unaffected: syncing, verifying, restoring and File Status all work
-whether or not the extension can be told about it.
+**The badges need one team signature and a normal launch.** The state reaches the extension through a
+file the app writes into the extension's sandbox container, and since macOS 14 a container is closed
+to processes outside the *team* that owns it. An ad-hoc signature — the default build here, and all
+`swift run` gives you — has no team at all, so the app is refused, logs
+`Finder badges could not be updated … You don't have permission to save the file …`, and badges
+nothing. Sign both bundles with one identity and it publishes:
+
+```bash
+MACOS_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/package.sh && scripts/install.sh
+```
+
+`scripts/verify.sh` reports the two halves separately: a note for an ad-hoc build, and a **failure**
+for an app and an extension signed by *different* teams, because that combination builds, launches,
+syncs and can never badge anything. There is one more condition, and it is macOS's rather than the
+app's: it has to be started by LaunchServices (Finder, `open`, a login item), not launched from a
+shell — the container decision follows the responsible process, so a shell-started run is refused
+however the build is signed. AGENTS.md has the measurements, including the log lines.
 
 This is a Finder extension, so it has to be switched on once: `scripts/install.sh` does it for you,
 or **System Settings → General → Login Items & Extensions → Finder Extensions → NeoDrop**. The
@@ -435,8 +446,8 @@ Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, the 
   VaultStatus.swift      per-folder display state for the menu and Settings
 Sources/NeoDropShared/   the badge format, shared by the app and the Finder extension
 Sources/NeoDropFinder/   the Finder Sync extension: the badges next to a file's date
-Tests/NeoDropCoreTests/  187 tests: one per safety rule above, plus the vault, web-UI parsing, path
-                         and badge cases. The container-channel one fails on purpose — see AGENTS.md
+Tests/NeoDropCoreTests/  193 tests: one per safety rule above, plus the vault, web-UI parsing, path
+                         and badge cases — the container one asserts both sides of the signing rule
 Resources/AppIcon.png    master app-icon artwork, masked by scripts/make-icon.swift
 Resources/MenuBarIcon*.png  menu bar template icon at 1x/2x/3x, plus the .svg master
 Resources/dmg-background.png  installer window wallpaper, as supplied (the master)
@@ -449,6 +460,7 @@ scripts/                 build, icon generation, packaging, verification, e2e, f
   e2e-vault.sh           two real installs against one vault: both directions, joining, deletions
   install.sh             copy into /Applications and switch the Finder extension on
   reset.sh               the clean-install path: removes this Mac's state, never your data
+  uninstall.sh           the other direction: the app, the Finder extension and the state, all gone
   setup-dmg-tools.sh     installs dmgbuild into .venv (optional, for the layout)
 packaging/               Info.plist and entitlements templates, for the app and the extension
 build/                   generated: NeoDrop.app, .icns, .dmg
@@ -481,7 +493,7 @@ The app must be quit first (the script checks and refuses). Four paths go:
 | `~/Library/Application Support/NeoDrop/` | config, manifests, source index, deletion records, log, machine identity |
 | `~/Library/Preferences/ai.storyteller.neodrop.plist` | the little macOS remembers about the app (window state) |
 | `~/Library/Saved Application State/ai.storyteller.neodrop.savedState` | window restoration state |
-| `~/Library/Containers/ai.storyteller.neodrop.finder/…/NeoDrop/finder-status.json` | the badge index the Finder extension reads — removed so Finder cannot keep badging folders NeoDrop has just forgotten (the container itself is left alone; macOS owns it) |
+| `~/Library/Containers/ai.storyteller.neodrop.finder/…/NeoDrop/finder-status.json` | the badge index the Finder extension reads — removed so Finder cannot keep badging folders NeoDrop has just forgotten. On macOS 26 it stays: a container refuses writes from processes outside the team that owns it, and the script reports it as kept rather than as a failure it cannot fix |
 
 And two things stay, deliberately: **your folders** — every source, destination and two-way folder
 in `config.json` is listed and left alone — and the **vault's `.neodrop/` on the share**, because its
@@ -490,9 +502,11 @@ removed only with `--app`. Pass `--keep-machine-name` to keep the identity so th
 this Mac by name. With `NEODROP_HOME` set, only that installation is touched.
 
 Afterwards the app starts as a fresh install and the setup wizard offers itself again. Note what it
-costs: each destination then holds files with no local record of them, so the next sync re-hashes and
-writes nothing, but a deletion performed *before* the reset can no longer be restored (the record
-that pointed at the retained copy is gone).
+costs: each destination then holds files with no local record of them, so the next sync walks the
+share and re-hashes what it finds — files that match the source are *adopted* into the new manifest
+rather than uploaded again, so the cost is a read of the share, not a write to it. What is genuinely
+lost is history: a deletion performed *before* the reset can no longer be restored, because the
+record that pointed at the retained copy is gone with the state directory.
 
 Every piece of per-machine state is local; the only thing shared is the vault itself. That is
 deliberate: two machines must never write the same file, and a machine that copied another's
@@ -501,21 +515,61 @@ identity would do exactly that.
 Set `NEODROP_HOME` to run the app against a different state directory (used by `scripts/e2e.sh`);
 pointing two of them at one vault is how `scripts/e2e-vault.sh` runs two machines on one Mac.
 
+### Uninstall
+
+```bash
+scripts/uninstall.sh                      # dry run: the app, the Finder extension and the state, plus what stays
+scripts/uninstall.sh --yes                # carries it out
+scripts/uninstall.sh --yes --trash        # the state goes to the Trash instead of being deleted
+scripts/uninstall.sh --yes --keep-state   # remove the app and the extension, keep this Mac's state
+scripts/uninstall.sh --yes --keep-app     # keep the app, remove the extension and the state
+scripts/uninstall.sh --yes --app /path/to/AnotherCopy.app   # a copy somewhere else (repeatable)
+```
+
+Deleting the app is not uninstalling it. The state lives in Application Support, and a Finder Sync
+extension outlives the app it came from: PlugInKit keeps the registration and goes on loading it into
+Finder after the bundle is in the Trash. The script removes, in this order:
+
+1. **Every installed copy of the app**, found by bundle identifier rather than by file name, with the
+   copies PlugInKit is actually loading the extension from printed on the way past. A second copy
+   left in place keeps the extension alive — which is why removing one `NeoDrop.app` can look like it
+   changed nothing at all.
+2. **The extension's registration**, taken away while the bundle is still on disk (that is what
+   `pluginkit -r` needs), plus the `~/Library/Application Scripts/ai.storyteller.neodrop.finder/`
+   directory macOS created for it.
+3. **This Mac's state**, by calling `scripts/reset.sh`, so there is one definition of what that is.
+
+Two things stay, and the script prints both. **Your folders** and the vault's `.neodrop/` on the
+share, exactly as a reset leaves them. And the extension's **sandbox container**,
+`~/Library/Containers/ai.storyteller.neodrop.finder/`, with the badge index inside it: on macOS 26
+that container belongs to the system's container manager and nothing else can remove it — creating,
+deleting and even listing inside it all come back `Operation not permitted`, for the app as much as for
+a script, for Finder with its own privileges, and for `sudo`. So the index outlives the app; it is
+inert once no extension is registered, because nothing reads it, and macOS discards containers of apps
+it knows are gone on its own schedule. If “Launch at Login” was ever switched on, the login item is registered through
+SMAppService and only the app can take it back: the script says so instead of quietly leaving it, and
+turning it off in the app's menu (or System Settings → General → Login Items) is what removes it.
+
 ## Not built yet
 
 Deliberate omissions and known gaps, roughly in order of value:
 
-* **A channel from the app to the Finder extension that survives an app update.** The badges are
-drawn and correct, but the index cannot reach the extension once macOS seals its sandbox container —
-including after any update. AGENTS.md records the measurements and the two channels that can work (an
-XPC Mach service from the app, or a sandboxed app with a team-signed App Group). Until then the
-badges work on a fresh install and go quiet at the first update.
+* **A badge channel that needs no team signature.** With both bundles signed by one team the index
+  reaches the extension, which is the shipping answer; what is not built is a channel that also works
+  for an ad-hoc build, which would take an XPC Mach service from the app or a loopback server the
+  extension polls. AGENTS.md records why the file channel cannot be replaced by an App Group. The
+  container itself is a third case: nothing removes it — not a script, not the app, not root, not
+  Finder — so the uninstaller leaves it behind and says so.
 
 * **File history / versioning, in mirror mode.** A deletion is recoverable for 30 days everywhere,
   and a two-way folder keeps the previous contents of anything it overwrites in `.neodrop/versions/`
   for the same window — File Status shows that history per path. A *mirror* still has no versioning
   at all: the previous contents are gone the moment the new copy lands. A “Versions” browser over
   those retained blobs is the natural next step.
+* **Resolving a file NeoDrop will not replace, from inside the app.** A file somebody else put where
+  the mirror wants one is left alone, badged with a question mark and named in the run's report, and
+  the next step is on the share itself: move or delete it and sync again. “Take the share's copy” or
+  “replace it deliberately” are not built, so the decision is a Finder one for now.
 * **Making two-way folders work with a Mac that is asleep or offline for weeks.** Nothing is
   corrupted — the journal is append-only and the cursor is per machine — but a machine that was away
   for a long time does all its catching up in one sync, and a very large vault then means a long

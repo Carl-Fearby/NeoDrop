@@ -67,6 +67,23 @@ final class FileStatusTests: XCTestCase {
         XCTAssertTrue(report.summary.contains("still in NAS1"), report.summary)
     }
 
+    /// The report has to explain the one file a mirror deliberately leaves alone, and say what to do
+    /// about it. "NeoDrop has no record of writing it" is true but leaves the reader nowhere: the
+    /// next step is theirs, and it is deleting or moving the file on the share.
+    func testAFileTheMirrorRefusedToReplaceIsExplained() async throws {
+        try sandbox.write("ours", to: "report.txt")
+        let inTheWay = sandbox.replicaURLs[0].appendingPathComponent("report.txt")
+        try "theirs".write(to: inTheWay, atomically: true, encoding: .utf8)
+        _ = await sandbox.engine().sync(config: sandbox.config())
+
+        let report = query().report(for: inTheWay)
+        let replica = try XCTUnwrap(location(report, .replica, name: "NAS1"))
+        XCTAssertTrue(replica.present)
+        XCTAssertTrue(replica.note.contains("left it alone rather than replace it"), replica.note)
+        XCTAssertFalse(replica.note.contains("did not come from this Mac"),
+                       "the generic answer is no longer enough: this one has a next step")
+    }
+
     func testAPathOutsideEveryFolderIsSaidToBeUnprotected() throws {
         let report = query().report(for: sandbox.root.appendingPathComponent("elsewhere/notes.txt"))
 

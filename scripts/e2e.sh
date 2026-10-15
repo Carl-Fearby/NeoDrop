@@ -58,10 +58,15 @@ cleanup() {
   fi
   # The app publishes its badge index to wherever the *installed* Finder extension reads it, not to
   # the scratch state directory (it cannot: the extension is sandboxed and its container is the only
-  # place both processes can reach). This test therefore writes into that container, and removes what
-  # it wrote — a test run must not leave the user's Finder badging a temporary folder. A real
-  # installation republishes on its next refresh, so the worst case is badges going quiet briefly.
+  # place both processes can reach). This run therefore leaves an index in that container, and the
+  # attempt to remove it is usually refused: a container is closed to processes outside the team that
+  # owns it (AGENTS.md), and this shell is not in it. Nothing to panic about — the installed app
+  # republishes its own index on the next refresh — but saying nothing would be claiming a cleanup
+  # that did not happen.
   rm -f "$BADGE_INDEX" 2>/dev/null
+  if [ -f "$BADGE_INDEX" ]; then
+    printf '  --   the badge index this run published is still in the container (a shell cannot delete inside one); the installed app republishes over it\n'
+  fi
   rm -f "$STATE"/finder-status.json 2>/dev/null
   if [ "$KEEP" -eq 0 ]; then rm -rf "$WORK"; else printf 'kept: %s\n' "$WORK"; fi
 }
@@ -168,21 +173,32 @@ fi
 # links that fail silently on their own: the app has to publish the index, it has to land where the
 # sandboxed extension can read it, and it has to name the folders it is protecting. A green tick that
 # is never drawn looks exactly like a file nobody asked about.
-if grep -q "Finder badges updated" "$STATE/neodrop.log" 2>/dev/null; then
-  pass "the app published what Finder should badge"
-else
-  fail "the app never published a badge index"
-fi
-
-if [ -f "$BADGE_INDEX" ]; then
-  pass "the badge index reached the container the Finder extension reads"
-  if grep -q "$SOURCE" "$BADGE_INDEX" 2>/dev/null; then
-    pass "the index names the folder it protects"
+# The index itself — what the badges would say — is checkable here: the app keeps a second copy in its
+# own state directory, which is an ordinary file. That copy naming the protected folder is the link
+# that fails when the app publishes nothing at all.
+if [ -f "$STATE/finder-status.json" ]; then
+  if grep -q "$SOURCE" "$STATE/finder-status.json" 2>/dev/null; then
+    pass "the published index names the folder it protects"
   else
     fail "the published index does not mention $SOURCE"
   fi
 else
-  fail "no badge index at $BADGE_INDEX: the extension would draw nothing"
+  fail "the app published no index at all: the extension would draw nothing"
+fi
+
+# The other half — that the index *reaches* the extension's container — cannot be checked from this
+# instance, and that is a property of macOS rather than of the product. A container is closed to
+# processes outside the team that owns it, and for anything started from a shell the responsible
+# process is the shell, which has no team: measured here, the same binary publishes when
+# LaunchServices starts it and is refused when a shell does (AGENTS.md has the log lines). So the
+# launch path is what has to be checked, and the last section of this script does exactly that, with
+# the installed app and `open`.
+if grep -q "Finder badges updated" "$STATE/neodrop.log" 2>/dev/null; then
+  pass "the app published the index, container copy included"
+elif grep -q "Finder badges could not be updated" "$STATE/neodrop.log" 2>/dev/null; then
+  note "this shell-launched instance could not write the container (expected); the launch-path section at the end checks the real one"
+else
+  fail "the app never said anything about the badge index"
 fi
 
 # ---- what landed on the shares -----------------------------------------------------------------
@@ -390,6 +406,42 @@ else
   fail "the activity log has no completed sync"
 fi
 
+# ---- somebody else's file, where the mirror wants one -------------------------------------------
+# The sharpest promise the engine makes: a file NeoDrop did not write is never replaced. The bytes may
+# exist nowhere else, and a name collision in a shared folder is no reason to lose them. Staged the
+# way it happens in real life — the file is already sitting there when the source gains a file of that
+# name — and checked byte for byte after a real sync, on the replica that has it and the replica that
+# does not.
+FOREIGN_RELATIVE="Documents/2026/quarterly-notes.txt"
+printf 'written by a person, not by NeoDrop\n' > "$NAS1/$FOREIGN_RELATIVE"
+printf 'a new file, sharing a name with somebody else\n' > "$SOURCE/$FOREIGN_RELATIVE"
+DEADLINE=$((SECONDS + 30))
+while [ $SECONDS -lt $DEADLINE ]; do
+  [ -f "$NAS2/$FOREIGN_RELATIVE" ] && break
+  sleep 1
+done
+
+if [ -f "$NAS1/$FOREIGN_RELATIVE" ] \
+   && grep -q "written by a person" "$NAS1/$FOREIGN_RELATIVE" 2>/dev/null; then
+  pass "a file NeoDrop did not write survived the sync, byte for byte"
+else
+  fail "the file somebody put on the share was replaced: $(cat "$NAS1/$FOREIGN_RELATIVE" 2>&1 | head -1)"
+fi
+
+if [ -f "$NAS2/$FOREIGN_RELATIVE" ] \
+   && grep -q "sharing a name with somebody else" "$NAS2/$FOREIGN_RELATIVE" 2>/dev/null; then
+  pass "the other replica mirrored it as usual, so the refusal is per file"
+else
+  fail "the second replica never received $FOREIGN_RELATIVE"
+fi
+
+if grep -q "not written by NeoDrop" "$STATE/neodrop.log" 2>/dev/null; then
+  pass "and the run says which file it left alone"
+  note "$(grep 'not written by NeoDrop' "$STATE/neodrop.log" | tail -1 | cut -c1-160)"
+else
+  fail "nothing in the activity log mentions the file it left alone"
+fi
+
 # ---- optional: the same app against real mounted volumes ---------------------------------------
 if [ "$VOLUMES" -eq 1 ]; then
   echo
@@ -503,6 +555,42 @@ JSON
   rm -rf "/Volumes/NeoDropNAS1/NeoDrop-b" 2>/dev/null
   "$ROOT/scripts/fake-nas.sh" destroy >/dev/null 2>&1
   pass "fake NAS volumes detached and deleted"
+fi
+
+# ---- the badge channel, launched the way a user's Mac launches it --------------------------------
+# This is the one link the rest of the script cannot reach: the app has to be started by LaunchServices
+# (Finder, `open`, a login item) *and* share a team identity with the extension before macOS lets it
+# write into the extension's container. Both halves are checked here, the second one by starting the
+# installed app the way Finder would and looking at where the index lands.
+INSTALLED_APP="/Applications/NeoDrop.app"
+if [ ! -d "$INSTALLED_APP" ]; then
+  note "no app in /Applications, so the container half of the badge channel was not checked (scripts/install.sh puts one there)"
+elif [ "$(codesign -dvv "$INSTALLED_APP" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2}')" = "not set" ]; then
+  note "the installed app is signed ad-hoc, so nothing it publishes can reach the container (AGENTS.md): badges cannot work in this build, and that is a note rather than a failure"
+else
+  BADGE_STATE="$WORK/badge-state"
+  mkdir -p "$BADGE_STATE"
+  cp "$STATE/config.json" "$BADGE_STATE/config.json"
+  open -a "$INSTALLED_APP" --env "NEODROP_HOME=$BADGE_STATE"
+  DEADLINE=$((SECONDS + 20))
+  while [ $SECONDS -lt $DEADLINE ]; do
+    grep -q "Finder badges" "$BADGE_STATE/neodrop.log" 2>/dev/null && break
+    sleep 1
+  done
+  if grep -q "Finder badges updated" "$BADGE_STATE/neodrop.log" 2>/dev/null; then
+    pass "launched by LaunchServices, the app's index reached the extension's container"
+    if grep -q "$SOURCE" "$BADGE_STATE/finder-status.json" 2>/dev/null; then
+      pass "and the index it published is the one this run built"
+    else
+      fail "the installed app published an index that does not mention $SOURCE"
+    fi
+  elif [ -s "$BADGE_STATE/neodrop.log" ]; then
+    grep "Finder badges" "$BADGE_STATE/neodrop.log" | tail -1 | sed 's/^/       /'
+    fail "the installed, team-signed app could not publish its badge index"
+  else
+    note "the installed app did not start (LaunchServices may have preferred the running instance): the container half was not checked"
+  fi
+  pkill -f "$INSTALLED_APP/Contents/MacOS/NeoDrop" >/dev/null 2>&1 || true
 fi
 
 echo

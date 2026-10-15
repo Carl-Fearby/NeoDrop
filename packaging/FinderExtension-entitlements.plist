@@ -8,9 +8,11 @@
      what a sandboxed extension buys and what it costs:
 
        * the extension can read nothing outside its own container;
-       * the app publishes the badge index into that container from outside, which is the only channel
-         the two processes need, and is why no App Group is declared here either — see
-         packaging/entitlements.plist for the measurements behind that decision.
+       * the app publishes the badge index into that container from outside — the only channel the two
+         processes need — which works when both bundles carry the same team identity and is refused
+         otherwise: an ad-hoc build badges nothing at all (macOS 14+ protects a container from other
+         teams). No App Group is declared here either; see packaging/entitlements.plist for the
+         measurements behind both decisions, and AGENTS.md for the log lines.
 
      Deliberately absent: any file access. The extension never opens the user's files — Finder hands it
      URLs and the index hands it badge identifiers, and both are just strings — so it needs no
