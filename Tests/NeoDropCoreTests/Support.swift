@@ -114,6 +114,11 @@ final class Sandbox {
     }
 
     /// Digest of every file on every replica, for comparing replicas to one another.
+    ///
+    /// `.neodrop-trash` is skipped on purpose: it holds retained copies of deleted files, not
+    /// mirrored data, so counting it here would make "the mirror is empty" and "the replicas
+    /// still agree" mean something other than what these tests are asking. The retained copies
+    /// have their own helpers below.
     func mirrorContents() throws -> [String: [String: String]] {
         var result: [String: [String: String]] = [:]
         for (index, url) in replicaURLs.enumerated() {
@@ -121,10 +126,57 @@ final class Sandbox {
             let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey])
             while let file = enumerator?.nextObject() as? URL {
                 guard !FileMeta.isDirectory(file) else { continue }
-                files[Scanner.relativePath(of: file, under: url)] = try Hashing.sha256(ofFileAt: file)
+                let relative = Scanner.relativePath(of: file, under: url)
+                if relative == DeleteRecord.trashDirectoryName || relative.hasPrefix(DeleteRecord.trashDirectoryName + "/") {
+                    continue
+                }
+                files[relative] = try Hashing.sha256(ofFileAt: file)
             }
             result["NAS\(index + 1)"] = files
         }
         return result
+    }
+
+    // MARK: - Deleted-file retention
+
+    var deleteStore: DeleteStore { DeleteStore(paths: storePaths) }
+
+    func records(_ index: Int) -> [DeleteRecord] {
+        deleteStore.load(replicaID: replicaModels[index].id)
+    }
+
+    func record(_ index: Int, _ relativePath: String) -> DeleteRecord? {
+        records(index).first { $0.relativePath == relativePath }
+    }
+
+    /// Replace a replica's records wholesale — the way a test stages "this deletion happened a
+    /// month ago" without waiting a month.
+    func writeRecords(_ records: [DeleteRecord], index: Int) throws {
+        try deleteStore.save(records, for: replicaModels[index].id)
+    }
+
+    func trashURL(_ index: Int, _ relativePath: String) -> URL {
+        DeleteRecord(relativePath: relativePath, sourcePath: "", size: 0, sha256: "")
+            .trashURL(onReplicaRoot: replicaURLs[index])
+    }
+
+    func trashExists(_ index: Int, _ relativePath: String) -> Bool {
+        FileManager.default.fileExists(atPath: trashURL(index, relativePath).path)
+    }
+
+    func trashContents(_ index: Int, _ relativePath: String) throws -> String {
+        try String(contentsOf: trashURL(index, relativePath), encoding: .utf8)
+    }
+
+    func removeTrash(_ index: Int, _ relativePath: String) throws {
+        try FileManager.default.removeItem(at: trashURL(index, relativePath))
+    }
+
+    func sourceFile(_ relativePath: String) -> URL {
+        source.appendingPathComponent(relativePath)
+    }
+
+    func sourceDigest(_ relativePath: String) throws -> String {
+        try Hashing.sha256(ofFileAt: sourceFile(relativePath))
     }
 }

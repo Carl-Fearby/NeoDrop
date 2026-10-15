@@ -113,6 +113,9 @@ final class MenuController: NSObject, NSMenuDelegate {
         add("Verify & Repair All", #selector(verifyAll), key: "r", enabled: !model.isBusy && model.config.isConfigured)
 
         menu.addItem(.separator())
+        add("Deleted Files…", #selector(openDeletedFiles), key: "d", enabled: model.deletedFilesAvailable)
+
+        menu.addItem(.separator())
         menu.addItem(replicasMenu())
         menu.addItem(activityMenu())
 
@@ -280,6 +283,7 @@ final class MenuController: NSObject, NSMenuDelegate {
     @objc private func syncNow() { model.syncNow() }
     @objc private func verifyAll() { model.verifyNow(repair: true) }
     @objc private func openSettings() { model.onOpenSettings?() }
+    @objc private func openDeletedFiles() { model.onOpenDeletedFiles?() }
     @objc private func toggleLaunchAtLogin() { model.setLaunchAtLogin(!model.launchAtLogin) }
     @objc private func openLogFolder() { model.openLog() }
     @objc private func quit() { NSApplication.shared.terminate(nil) }

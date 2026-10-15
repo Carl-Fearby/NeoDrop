@@ -12,7 +12,7 @@ There is no server and no cloud component.
 
 ```bash
 swift build                                        # compile everything
-swift test                                         # 68 engine tests, must stay green
+swift test                                         # 103 engine tests, must stay green
 swift run NeoDrop                                  # run the app (menu bar icon)
 swift build -c release --show-bin-path             # locate the release binary
 scripts/package.sh [--arch universal] [--no-dmg]   # .app + DMG, ad-hoc signed by default
@@ -48,6 +48,31 @@ behaviour, change the test only with a written reason.
    (`testAtomicCopyLeavesNoTempFilesBehind`).
 6. **Verification re-hashes.** Never replace it with a size or mtime comparison
    (`testVerifyDetectsSilentCorruption`).
+7. **A deletion is recorded before it happens, and the bytes outlive it by 30 days.** The file is
+   moved into `.neodrop-trash/` on each replica with a record describing where it came from, and a
+   restore never overwrites anything (`testDeletedFileIsRetainedInsteadOfDestroyed`,
+   `testRestoreRefusesToOverwriteADifferentFile`). Records and bytes are removed together, and only
+   once the window has closed (`testExpiredRecordIsPurgedWithItsBytes`).
+8. **A record is data, not a command.** Every path read out of a record is checked to be inside the
+   directory it belongs in before anything is deleted, written or restored
+   (`testRecordThatEscapesTheTrashDirectoryIsNeverActedOn`).
+
+## The deleted-files web view
+
+The “Deleted Files…” menu item opens a `WKWebView` onto a loopback HTTP server in `NeoDropCore`
+(`WebUIServer.swift` serves, `WebUIPage.swift` is the single self-contained page). It is deliberately
+small, and the parts that make it safe are not decoration:
+
+* it binds `127.0.0.1` only, on a port the OS picks;
+* every route sits behind a random per-launch token in the path, and a request without it gets a
+  plain 404 so an unrelated local process cannot even tell the server is there;
+* the `Host` header must name a loopback host, and a `POST` carrying a foreign `Origin` is refused;
+* the page makes no external requests, so its CSP allows nothing but its own inline style and script.
+
+The engine owns the data (`listDeletions`, `restore`, `purgeExpiredDeletions`); the server only
+formats it. Config reaches the handlers through `AppModel`, because the engine must never re-read
+`config.json`. The app logs the page URL on startup (`Deleted files view ready at …`), which is how
+`scripts/e2e.sh` drives it.
 
 ## The icon
 

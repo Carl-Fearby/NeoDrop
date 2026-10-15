@@ -206,7 +206,9 @@ else
   pass "excluded file .DS_Store stayed out of the mirror"
 fi
 
-# A deleted source file should disappear from every replica (small deletion, guard not tripped).
+# A deleted source file should disappear from every replica (small deletion, guard not tripped),
+# and its bytes should still exist under the trash directory on both.
+REPORT_DIGEST="$(shasum -a 256 "$SOURCE/Documents/report.txt" | cut -d' ' -f1)"
 rm -f "$SOURCE/Documents/report.txt"
 DEADLINE=$((SECONDS + 30))
 while [ $SECONDS -lt $DEADLINE ]; do
@@ -217,6 +219,135 @@ if [ ! -f "$NAS1/Documents/report.txt" ] && [ ! -f "$NAS2/Documents/report.txt" 
   pass "a deletion in the source propagated to both replicas"
 else
   fail "deletion did not propagate"
+fi
+
+# ---- deleted files: retention, the web view, and restoring through it ---------------------------
+
+# The deletion is a rename, not a delete: identical bytes, trashed on both replicas.
+for volume in NAS1 NAS2; do
+  TRASHED="$WORK/$volume/NeoDrop/.neodrop-trash/Documents/report.txt"
+  if [ ! -f "$TRASHED" ]; then
+    fail "$volume did not retain the deleted file in .neodrop-trash"
+  elif [ "$(shasum -a 256 "$TRASHED" | cut -d' ' -f1)" != "$REPORT_DIGEST" ]; then
+    fail "$volume retained different bytes than the file that was deleted"
+  else
+    pass "$volume keeps the deleted bytes, digest for digest"
+  fi
+done
+
+# A record per replica, with the recovery window the app advertises. Records are looked up in the
+# deletes directory rather than by a guessed file name: the name is the replica UUID, and pinning it
+# here would make this fail on a case change rather than on a regression.
+if python3 - "$STATE/deletes" <<'PY'
+import json, glob, os, sys
+from datetime import datetime
+records = []
+for path in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    records.append((os.path.basename(path), json.load(open(path))))
+matches = [(name, record)
+           for name, entries in records
+           for record in entries
+           if record["relativePath"] == "Documents/report.txt"]
+assert matches, "no record for the deleted file"
+assert len(matches) == 2, f"expected one record per replica, found {len(matches)}"
+for name, record in matches:
+    assert record["sha256"], "the record carries no digest to verify a restore against"
+    assert record["sourcePath"].endswith("Source/Documents/report.txt"), record["sourcePath"]
+    start = datetime.fromisoformat(record["deletedAt"].replace("Z", "+00:00"))
+    end = datetime.fromisoformat(record["expiresAt"].replace("Z", "+00:00"))
+    days = (end - start).total_seconds() / 86400
+    assert 29.9 < days < 30.1, f"recovery window is {days} days"
+PY
+then
+  pass "a deletion record with a 30-day window was written for each replica"
+else
+  fail "no usable deletion record for the deleted file"
+fi
+
+# The in-app web view. The app logs the URL it is serving; drive it the way the page does.
+WEB_URL="$(grep -o 'Deleted files view ready at http://127.0.0.1:[0-9]*/[a-f0-9]*/' "$STATE/neodrop.log" 2>/dev/null | tail -1 | sed 's/^Deleted files view ready at //')"
+if [ -n "$WEB_URL" ]; then
+  pass "the app started its deleted-files view"
+
+  if curl -fsS --max-time 10 "$WEB_URL" | grep -q "Deleted Files"; then
+    pass "the deleted-files page is served on loopback"
+  else
+    fail "the deleted-files page did not load from $WEB_URL"
+  fi
+
+  # Parsed as JSON, not grepped: the assertion is about the entry, not about how the encoder
+  # happens to spell a path.
+  if curl -fsS --max-time 10 "${WEB_URL}api/deletions" | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+entries = {f["relativePath"]: f for f in payload["files"]}
+entry = entries.get("Documents/report.txt")
+assert entry, f"deleted file not listed: {sorted(entries)}"
+assert payload["retentionDays"] == 30, payload["retentionDays"]
+assert entry["restorable"], "the page would offer no working Restore button"
+assert all(c["available"] for c in entry["copies"]), entry["copies"]
+'; then
+    pass "the page's API lists the deletion as restorable on every destination"
+  else
+    fail "the deletions API did not list the deleted file as restorable"
+  fi
+
+  # Without the token, a local process (or a page that guessed the port) learns nothing.
+  PORT="$(printf '%s' "$WEB_URL" | sed -E 's|http://127.0.0.1:([0-9]+)/.*|\1|')"
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1:$PORT/")"
+  if [ "$CODE" = "404" ]; then
+    pass "a request without the token is refused"
+  else
+    fail "an unauthenticated request returned $CODE, expected 404"
+  fi
+
+  # Restore through the API, exactly as the Restore button does.
+  CODE="$(curl -s -o "$WORK/restore.json" -w '%{http_code}' --max-time 30 \
+    -X POST -H 'Content-Type: application/json' \
+    -d '{"relativePath":"Documents/report.txt"}' "${WEB_URL}api/restore")"
+  if [ "$CODE" = "200" ]; then
+    pass "restoring through the web view returned 200"
+  else
+    fail "restore returned $CODE: $(head -c 200 "$WORK/restore.json")"
+  fi
+
+  if [ -f "$SOURCE/Documents/report.txt" ] \
+     && [ "$(shasum -a 256 "$SOURCE/Documents/report.txt" | cut -d' ' -f1)" = "$REPORT_DIGEST" ]; then
+    pass "the restored file is back in its original folder, byte for byte"
+  else
+    fail "the restored file is missing from $SOURCE/Documents or has different contents"
+  fi
+
+  if [ -f "$WORK/NAS1/NeoDrop/.neodrop-trash/Documents/report.txt" ] \
+     || [ -f "$WORK/NAS2/NeoDrop/.neodrop-trash/Documents/report.txt" ]; then
+    fail "the retained copies were not given back after the restore"
+  else
+    pass "the retained copies were released once the file was back"
+  fi
+
+  # It is mirrored again: the sync the app kicks off after a restore.
+  DEADLINE=$((SECONDS + 30))
+  while [ $SECONDS -lt $DEADLINE ]; do
+    [ -f "$NAS1/Documents/report.txt" ] && [ -f "$NAS2/Documents/report.txt" ] && break
+    sleep 1
+  done
+  if [ -f "$NAS1/Documents/report.txt" ] && [ -f "$NAS2/Documents/report.txt" ]; then
+    pass "the restored file is mirrored to both replicas again"
+  else
+    fail "the restored file was not re-mirrored"
+  fi
+
+  if curl -fsS --max-time 10 "${WEB_URL}api/deletions" | python3 -c '
+import json, sys
+paths = [f["relativePath"] for f in json.load(sys.stdin)["files"]]
+assert "Documents/report.txt" not in paths, paths
+'; then
+    pass "the restored file left the deleted-files list"
+  else
+    fail "the restored file is still listed as deleted"
+  fi
+else
+  fail "the app never logged a deleted-files URL: $(grep -c 'Deleted files view' "$STATE/neodrop.log" 2>/dev/null || echo 0) line(s)"
 fi
 
 if grep -q "Done in" "$STATE/neodrop.log" 2>/dev/null; then

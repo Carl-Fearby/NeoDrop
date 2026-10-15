@@ -24,6 +24,7 @@ public struct StorePaths: Sendable {
     public var logURL: URL { base.appendingPathComponent("neodrop.log") }
     public var manifestsDirectory: URL { base.appendingPathComponent("manifests", isDirectory: true) }
     public var locksDirectory: URL { base.appendingPathComponent("locks", isDirectory: true) }
+    public var deletesDirectory: URL { base.appendingPathComponent("deletes", isDirectory: true) }
 
     public func manifestURL(for replicaID: UUID) -> URL {
         manifestsDirectory.appendingPathComponent("\(replicaID.uuidString).json")
@@ -31,7 +32,7 @@ public struct StorePaths: Sendable {
 
     public func ensureDirectories() throws {
         let fm = FileManager.default
-        for directory in [base, manifestsDirectory, locksDirectory] {
+        for directory in [base, manifestsDirectory, locksDirectory, deletesDirectory] {
             try fm.createDirectory(at: directory, withIntermediateDirectories: true)
         }
     }
@@ -40,7 +41,10 @@ public struct StorePaths: Sendable {
 enum JSONFile {
     static func encoder() -> JSONEncoder {
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        // Slashes stay as slashes. Record and manifest paths are file paths, and `Documents\/a.txt`
+        // is the same JSON but nobody can read it — including whoever opens a record to see what
+        // NeoDrop is holding. Decoding is unaffected either way.
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
         return encoder
     }
@@ -116,6 +120,51 @@ public struct ManifestStore: Sendable {
     }
 }
 
+/// Reads and writes the per-replica deletion manifests. Each replica keeps its own file under
+/// the deletes directory, exactly the same shape as `manifests/` — one JSON object per replica,
+/// atomic writes via a temp file, so a crash mid-write cannot leave a half-written record.
+public struct DeleteStore: Sendable {
+    public let paths: StorePaths
+
+    public init(paths: StorePaths = .standard) { self.paths = paths }
+
+    /// Where a single replica's records live. The file name is the replica UUID so a profile with
+    /// many replicas never collides with another, and the file is small enough that reading the
+    /// whole thing is cheap for a web UI listing one replica at a time.
+    public func URL(for replicaID: UUID) -> URL { paths.deletesDirectory.appendingPathComponent(replicaID.uuidString + ".json") }
+
+    public func ensureDirectories() throws {
+        try paths.ensureDirectories()
+    }
+
+    /// Load the record for one replica. Missing is not an error: a new replica has no records.
+    public func load(replicaID: UUID) -> [DeleteRecord] {
+        JSONFile.load([DeleteRecord].self, from: URL(for: replicaID)) ?? []
+    }
+
+    /// Persist in place so a partial write cannot touch the previous value: `JSONFile.save`
+    /// writes a temp file and renames it over the old one, and uses the same ISO-8601 date
+    /// strategy `JSONFile.load` decodes with — encoding dates a different way here would write
+    /// records that silently fail to load again.
+    public func save(_ records: [DeleteRecord], for replicaID: UUID) throws {
+        try paths.ensureDirectories()
+        try JSONFile.save(records, to: URL(for: replicaID))
+    }
+
+    /// Remove the record for a recovered file so it stops appearing in the web UI as recoverable.
+    public func remove(_ id: UUID, for replicaID: UUID) throws {
+        var records = load(replicaID: replicaID)
+        records.removeAll { $0.id == id }
+        try save(records, for: replicaID)
+    }
+
+    /// Purge is deliberately not here. Expiring a record must free its retained bytes on the
+    /// replica at the same time, which needs the configuration's replica roots — the engine owns
+    /// that (`purgeExpiredDeletions`), and a store that could drop records alone would be able to
+    /// orphan copies nothing would ever find again.
+}
+
+/// Reads and writes the per-replica runtime state.
 public struct RuntimeStateStore: Sendable {
     public let paths: StorePaths
 
@@ -131,6 +180,7 @@ public struct RuntimeStateStore: Sendable {
     }
 }
 
+/// Reads and writes the per-source hash index.
 public struct SourceIndexStore: Sendable {
     public let paths: StorePaths
 

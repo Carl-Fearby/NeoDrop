@@ -20,6 +20,9 @@ habit:
   size and the wrong bytes is *not* healthy — see `testVerifyDetectsSilentCorruption`.
 * **Repair from anywhere.** A bad copy is rewritten from the source, or from another replica when
   the source no longer has the file. A wiped NAS is rebuilt from the survivors.
+* **A delete is a 30-day undo.** Delete a file in a protected folder and it does not vanish: each
+  share keeps the bytes under `.neodrop-trash/`, and the menu's **Deleted Files…** window lists
+  what is recoverable and puts it back.
 * **No credentials, ever.** NeoDrop never sees a NAS password. It mounts shares by asking Finder,
   which uses the credentials already in your Keychain.
 * **Nothing leaves the machine.** No account, no telemetry, no server.
@@ -38,7 +41,24 @@ source folders ──► scan + SHA-256 ──► plan ──► per-replica dif
 One Swift package, two targets: `NeoDropCore` (engine, no AppKit, fully testable) and `NeoDrop`
 (status item + SwiftUI settings).
 
-### The five rules that keep it safe
+### Deleted files
+
+When a file disappears from every source folder, NeoDrop does not delete it. On each share the copy
+is *renamed* into `.neodrop-trash/` at the same relative path — a rename, so nothing is re-uploaded —
+and a record says where it came from, its size and its checksum. The bytes stay for **30 days**.
+
+**Deleted Files…** in the menu opens the recovery window: everything currently recoverable, which
+destinations still hold a copy, how long each entry has left, and a Restore button. Restoring writes
+the file back to its original folder (verified against the record's checksum first), gives the
+retained copies back, and re-mirrors it to every share immediately. Nothing is ever overwritten: if a
+file already sits at the destination, the restore refuses unless it is byte-identical.
+
+Recovery is how deletions are *meant* to work, not a side channel: files that come back to the source
+are dropped from the list, and entries are purged — bytes and record together — only after their
+window closes. Turning `mirrorDeletions` off still makes a destination an archive that keeps
+everything; such a destination records nothing because it deletes nothing.
+
+### The rules that keep it safe
 
 These are the things that decide whether a tool like this protects data or destroys it, so they are
 all enforced in code and covered by tests:
@@ -50,6 +70,9 @@ all enforced in code and covered by tests:
 | Deletions are refused when a source could not be read | A renamed or unplugged source folder must never be interpreted as "everything was deleted" |
 | More than 25% of a replica (or 25 files) deleted in one run is refused unless explicitly allowed | Stops the signature mirroring disaster: one bad sync empties the NAS |
 | Every copy goes through a temp file plus a rename in the destination folder | A dropped SMB connection leaves the old file, not a truncated new one |
+| A deletion is recorded before it happens, and its bytes are kept for 30 days | "Undo" is the difference between a mirror and a shredder: a mistaken delete stays recoverable on every share |
+| A restore never overwrites, and never deletes ahead of its window | The copy in the trash is often the only copy left of a file, so nothing may be destroyed early or clobbered |
+| Paths read out of a record are checked against the directory they belong in | Records are editable JSON; a corrupt one must not be able to point a delete or a restore anywhere else |
 
 A missing source folder, an offline share, or a failed write never stops the other replicas from
 being brought up to date; it is reported and shown as degraded instead.
@@ -58,7 +81,7 @@ being brought up to date; it is reported and shown as degraded instead.
 
 ```bash
 swift build                 # library + app
-swift test                  # 68 engine tests
+swift test                  # 103 engine tests
 swift run NeoDrop           # menu bar icon appears immediately (reads/writes ~/Library/Application Support/NeoDrop)
 ```
 
@@ -217,7 +240,7 @@ NeoDrop refuses to guess, so it starts with nothing configured.
    *Mount …*, which asks Finder to connect (using your Keychain) and syncs once it appears.
 
 The menu shows each replica's status, file count, last sync and last verify, plus **Sync Now**,
-**Verify & Repair All**, a per-replica verify, and an activity log.
+**Verify & Repair All**, **Deleted Files…**, a per-replica verify, and an activity log.
 
 ### Trying it without a NAS
 
@@ -233,15 +256,17 @@ the warning when two replicas share a volume.
 
 ```
 Sources/NeoDropCore/     engine: scanning, hashing, mirroring, verification, repair
-  MirrorEngine.swift     sync / verify / repair, plus the deletion guard
+  MirrorEngine.swift     sync / verify / repair, the deletion guard, retention + restore
+  WebUIServer.swift      loopback HTTP server behind the deleted-files window
+  WebUIPage.swift        the deleted-files page: one self-contained document
   Scanner.swift          enumeration, excludes, cached source hashes
   Hashing.swift          streaming SHA-256, durable atomic writes
   Storage.swift          config, manifests, source index, runtime state (JSON)
   Volumes.swift          volume identity, SMB mount requests, boot-volume detection
   ConfigValidator.swift  "this configuration does not actually protect anything" checks
   FolderWatcher.swift    FSEvents with debounce
-Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings
-Tests/NeoDropCoreTests/  68 tests, including one per safety rule above
+Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, deleted-files web view
+Tests/NeoDropCoreTests/  103 tests, including one per safety rule above
 Resources/AppIcon.png    master app-icon artwork, masked by scripts/make-icon.swift
 Resources/MenuBarIcon*.png  menu bar template icon at 1x/2x/3x, plus the .svg master
 Resources/dmg-background.png  installer window artwork, as supplied (the master)
@@ -257,8 +282,10 @@ build/                   generated: NeoDrop.app, .icns, .dmg
 ```
 
 State lives in `~/Library/Application Support/NeoDrop/`: `config.json`, a manifest per replica, the
-source hash index, `runtime-state.json` and a rolling `neodrop.log`. Delete that folder and NeoDrop
-forgets everything — your data is unaffected.
+source hash index, `runtime-state.json`, a rolling `neodrop.log`, and `deletes/` — one file per
+replica listing the deletions it is still holding. Delete that folder and NeoDrop forgets everything
+— your data is unaffected, but the retained copies in `.neodrop-trash/` become files with no record
+pointing at them, which is what the delete-first purge order is designed to avoid.
 
 Set `NEODROP_HOME` to run the app against a different state directory (used by `scripts/e2e.sh`).
 
@@ -266,8 +293,9 @@ Set `NEODROP_HOME` to run the app against a different state directory (used by `
 
 Deliberate omissions, roughly in order of value:
 
-* **File history / versioning.** Right now a mirrored deletion is a real deletion. Keeping the last
-  N versions per replica would remove the remaining way to lose data.
+* **File history / versioning.** A deletion is recoverable for 30 days, but *overwriting* a file is
+  not: the previous contents are gone the moment the new copy lands. Keeping the last N versions of
+  a file that changed would close the last way to lose data.
 * **Erasure coding.** Full mirrors cost N× the storage. Sharding files so any K of N replicas can
   rebuild them would make large libraries practical, at the cost of "your data is still just files".
 * **Restoring a source from a replica.** Repair can rebuild a replica from the source or another

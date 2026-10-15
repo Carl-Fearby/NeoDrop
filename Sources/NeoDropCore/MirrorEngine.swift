@@ -88,6 +88,10 @@ public actor MirrorEngine {
         var summary = SyncSummary(phase: .scanning, startedAt: Date())
         progress(SyncProgress(phase: .scanning))
 
+        // Retention housekeeping before anything else: deletions whose 30-day window has closed
+        // give their space back on every destination that is currently mounted.
+        purgeExpiredDeletions(config: config)
+
         guard !config.sources.isEmpty else {
             summary.phase = .failed("No source folder is configured")
             summary.finishedAt = Date()
@@ -287,6 +291,12 @@ public actor MirrorEngine {
 
         var manifest = manifestStore.load(replicaID: replica.id)
 
+        // Retention bookkeeping, run on every sync regardless of `mirrorDeletions`: a record
+        // whose file is genuinely back in the source (same digest — the plan already hashed it)
+        // was restored, and a record whose retained bytes have vanished cannot restore anything.
+        // Both would otherwise linger as rows in the deleted-files view that do nothing.
+        reconcileRetainedCopies(replica: replica, plan: plan)
+
         // 1. Deletions: files NeoDrop wrote that no longer exist in any source.
         let pendingDeletions = manifest.entries.keys.filter { plan.files[$0] == nil }
         if !config.mirrorDeletions {
@@ -302,18 +312,71 @@ public actor MirrorEngine {
         ) {
             report.errors.append("Refused to remove \(pendingDeletions) of \(manifest.entries.count) mirrored files in one run. Check that the source folder is still the right one, or tick “Allow bulk deletions” in Settings to proceed.")
         } else {
-            // Snapshot the keys: the dictionary is mutated inside the loop.
-            for relativePath in pendingDeletions {
-                let destination = replica.url.appendingPathComponent(relativePath)
+            let deleteStore = DeleteStore(paths: paths)
+            var records = deleteStore.load(replicaID: replica.id)
+            let moving = Set(pendingDeletions.filter {
+                FileManager.default.fileExists(atPath: replica.url.appendingPathComponent($0).path)
+            })
+
+            // Manifest entries whose file is already not on the replica need no record — only
+            // the entry removal, since there are no bytes left to retain or destroy.
+            for relativePath in pendingDeletions where !moving.contains(relativePath) {
+                manifest.entries.removeValue(forKey: relativePath)
+                report.deleted += 1
+            }
+
+            if !moving.isEmpty {
+                // Records are saved before any byte moves: a record without bytes self-heals
+                // (the next sync finds no trash file and drops it), while bytes without a
+                // record are unreachable forever. If recording fails, nothing moves — a
+                // failure to record is a failure to delete, never a silent orphan.
+                for relativePath in moving {
+                    records.removeAll { $0.relativePath == relativePath }
+                    records.append(Self.recordForDeletion(
+                        relativePath: relativePath,
+                        config: config,
+                        previous: manifest.entries[relativePath]
+                    ))
+                }
+                var staged = true
                 do {
-                    if FileManager.default.fileExists(atPath: destination.path) {
-                        try FileManager.default.removeItem(at: destination)
-                    }
-                    manifest.entries.removeValue(forKey: relativePath)
-                    report.deleted += 1
+                    try deleteStore.save(records, for: replica.id)
                 } catch {
-                    report.failed += 1
-                    report.errors.append("delete \(relativePath): \(error.localizedDescription)")
+                    staged = false
+                    report.failed += moving.count
+                    report.errors.append(
+                        "Deletions skipped: could not record them for recovery (\(error.localizedDescription)) — nothing was removed from this replica."
+                    )
+                }
+
+                if staged {
+                    for relativePath in moving {
+                        let destination = replica.url.appendingPathComponent(relativePath)
+                        let trashURL = DeleteRecord(relativePath: relativePath, sourcePath: "", size: 0, sha256: "")
+                            .trashURL(onReplicaRoot: replica.url)
+                        do {
+                            try FileManager.default.createDirectory(
+                                at: trashURL.deletingLastPathComponent(), withIntermediateDirectories: true
+                            )
+                            // A retained copy from an earlier cycle of this same path loses to
+                            // the newest deletion: it was superseded when the file was recreated.
+                            if FileManager.default.fileExists(atPath: trashURL.path) {
+                                try FileManager.default.removeItem(at: trashURL)
+                            }
+                            // One SMB rename instead of an upload: the bytes never leave the share.
+                            try FileManager.default.moveItem(at: destination, to: trashURL)
+                            manifest.entries.removeValue(forKey: relativePath)
+                            report.deleted += 1
+                        } catch {
+                            // Drop the staged record again: it must never claim bytes that are
+                            // not in the trash. The manifest entry stays, so the file keeps
+                            // being treated as mirrored data and the deletion retries next sync.
+                            records.removeAll { $0.relativePath == relativePath }
+                            try? deleteStore.save(records, for: replica.id)
+                            report.failed += 1
+                            report.errors.append("delete \(relativePath): \(error.localizedDescription)")
+                        }
+                    }
                 }
             }
             Self.pruneEmptyDirectories(root: replica.url, keeping: Set(plan.files.keys))
@@ -385,6 +448,44 @@ public actor MirrorEngine {
         guard !allowBulkDeletions, known > 0, pending > 0 else { return false }
         let threshold = max(25, Int(Double(known) * 0.25))
         return pending > threshold
+    }
+
+    /// Build the record for a file that is about to leave the mirror. Nothing is touched on the
+    /// replica — only the description a restore needs: where it goes back, its size, and the
+    /// source's digest (the retained bytes are that same file renamed, so the manifest's hash
+    /// stays the right thing to verify a restore against).
+    private static func recordForDeletion(
+        relativePath: String,
+        config: AppConfig,
+        previous: ManifestEntry?
+    ) -> DeleteRecord {
+        DeleteRecord(
+            relativePath: relativePath,
+            sourcePath: sourcePath(forMirroredPath: relativePath, config: config),
+            size: previous?.size ?? 0,
+            sha256: previous?.sha256 ?? ""
+        )
+    }
+
+    /// Where a restore should put this mirrored path back: the absolute file URL in its source
+    /// root, resolved through the same namespacing the scanner applied when it was copied.
+    private static func sourcePath(forMirroredPath relativePath: String, config: AppConfig) -> String {
+        guard !config.sources.isEmpty else { return "" }
+        // With one source the mirrored path *is* the source-relative path. With several, the
+        // mirror is namespaced under the source's display name.
+        if config.sources.count == 1 {
+            return config.sources[0].url.appendingPathComponent(relativePath).path
+        }
+        for source in config.sources {
+            let prefix = source.displayName + "/"
+            if relativePath.hasPrefix(prefix) {
+                return source.url.appendingPathComponent(String(relativePath.dropFirst(prefix.count))).path
+            }
+        }
+        // The source was removed from the configuration between copy and delete: record the
+        // first root as a best guess so the entry is not simply lost; the restore path is
+        // validated against the configured roots before anything is written.
+        return config.sources[0].url.appendingPathComponent(relativePath).path
     }
 
     private func copy(_ origin: URL, to destination: URL, config: AppConfig) throws {
@@ -475,6 +576,255 @@ public actor MirrorEngine {
         return SourcePlan(files: files, errors: errors, allSourcesReadable: unreadable == 0)
     }
 
+    // MARK: - Deleted files: list, restore, purge
+
+    /// Everything the deleted-files view shows, aggregated across destinations.
+    ///
+    /// `relativePath` is the identity: each replica records the same logical deletion
+    /// independently, moments apart, so they are folded into one entry with one row per
+    /// destination. Expired entries are left out — they are purge fodder, and a row whose
+    /// restore button cannot work is worse than no row at all.
+    public func listDeletions(config: AppConfig) -> [DeletionEntry] {
+        let store = DeleteStore(paths: paths)
+        let fm = FileManager.default
+        let now = Date()
+        var recordsByPath: [String: [DeleteRecord]] = [:]
+        var copiesByPath: [String: [DeletionCopy]] = [:]
+
+        for replica in config.replicas {
+            let records = store.load(replicaID: replica.id)
+            guard !records.isEmpty else { continue }
+            // A reachable destination with a retained copy is what makes an entry restorable;
+            // an unmounted share is reported as unavailable rather than assumed gone.
+            let reachable = Self.isUsableDirectory(replica.url)
+            let trashRoot = self.trashRoot(replica.url)
+            for record in records where record.expiresAt > now {
+                let trashURL = record.trashURL(onReplicaRoot: replica.url)
+                let available = reachable
+                    && Self.isInside(trashURL, of: trashRoot)
+                    && fm.fileExists(atPath: trashURL.path)
+                recordsByPath[record.relativePath, default: []].append(record)
+                copiesByPath[record.relativePath, default: []].append(
+                    DeletionCopy(replicaID: replica.id, replicaName: replica.displayName, available: available)
+                )
+            }
+        }
+
+        return recordsByPath.compactMap { relativePath, records in
+            guard let earliest = records.min(by: { $0.deletedAt < $1.deletedAt }) else { return nil }
+            return DeletionEntry(
+                relativePath: relativePath,
+                sourcePath: records.first(where: { !$0.sourcePath.isEmpty })?.sourcePath ?? earliest.sourcePath,
+                size: earliest.size,
+                sha256: earliest.sha256,
+                deletedAt: earliest.deletedAt,
+                // The entry is only as safe as its weakest copy: the window closes for all of
+                // them at the first expiry, because that is when any of them may be purged.
+                expiresAt: records.map(\.expiresAt).min() ?? earliest.expiresAt,
+                copies: (copiesByPath[relativePath] ?? []).sorted { $0.replicaName < $1.replicaName }
+            )
+        }
+        // Newest first. Records are stored with second precision, so deletions in the same second
+        // are genuinely unordered — the path breaks the tie so the list never reshuffles itself
+        // between refreshes.
+        .sorted { left, right in
+            left.deletedAt == right.deletedAt
+                ? left.relativePath < right.relativePath
+                : left.deletedAt > right.deletedAt
+        }
+    }
+
+    /// Put a deleted file back where it came from, using the best verified retained copy.
+    ///
+    /// Safety rules, in the same spirit as the rest of the engine:
+    ///
+    /// * Nothing is ever overwritten. If a file already sits at the destination, the restore
+    ///   only counts as done when that file is byte-identical — the deletion was already undone.
+    ///   Anything else is a conflict and the user's new file wins.
+    /// * The retained bytes are verified against the digest in the record before the source
+    ///   folder is touched, and the written copy is verified again after it lands.
+    /// * The destination is validated against the configured source roots, so a record that was
+    ///   edited on disk cannot point a restore outside the folders the user protects.
+    @discardableResult
+    public func restore(relativePath: String, config: AppConfig) throws -> URL {
+        let store = DeleteStore(paths: paths)
+        let fm = FileManager.default
+
+        var recordByReplica: [UUID: DeleteRecord] = [:]
+        for replica in config.replicas {
+            if let record = store.load(replicaID: replica.id).first(where: { $0.relativePath == relativePath }) {
+                recordByReplica[replica.id] = record
+            }
+        }
+        guard let primary = recordByReplica.values.min(by: { $0.deletedAt < $1.deletedAt }) else {
+            throw NeoDropError.retainedCopyUnavailable(relativePath)
+        }
+        // No digest means no way to tell a good copy from a corrupt one, so there is nothing to
+        // verify a restore against. Refuse rather than write bytes we cannot vouch for.
+        guard !primary.sha256.isEmpty else { throw NeoDropError.retainedCopyUnavailable(relativePath) }
+        guard let target = Self.restoreTarget(record: primary, relativePath: relativePath, config: config) else {
+            throw NeoDropError.restoreSourceUnavailable(relativePath)
+        }
+        guard Self.isUsableDirectory(target.source.url) else {
+            throw NeoDropError.restoreSourceUnavailable(target.source.displayName)
+        }
+
+        if fm.fileExists(atPath: target.destination.path) {
+            if let existing = try? Hashing.sha256(ofFileAt: target.destination), existing == primary.sha256 {
+                // Already back (by hand, or by the other source root). Treat it as done and give
+                // the retained copies back.
+                discardRetainedCopies(relativePath: relativePath, config: config)
+                return target.destination
+            }
+            throw NeoDropError.restoreConflict(target.destination.path)
+        }
+
+        var lastError: Error = NeoDropError.retainedCopyUnavailable(relativePath)
+        var restored = false
+        // Replicas are tried in the order the user configured them, so the fastest share wins.
+        for replica in config.replicas {
+            guard let record = recordByReplica[replica.id], Self.isUsableDirectory(replica.url) else { continue }
+            let trashURL = record.trashURL(onReplicaRoot: replica.url)
+            guard Self.isInside(trashURL, of: trashRoot(replica.url)),
+                  fm.fileExists(atPath: trashURL.path) else { continue }
+            do {
+                let digest = try Hashing.sha256(ofFileAt: trashURL)
+                guard digest == primary.sha256 else {
+                    throw NeoDropError.retainedCopyUnavailable(relativePath)
+                }
+                try AtomicFile.copy(from: trashURL, to: target.destination)
+                guard let written = try? Hashing.sha256(ofFileAt: target.destination), written == digest else {
+                    // Do not leave a copy we cannot vouch for where the original used to be.
+                    try? fm.removeItem(at: target.destination)
+                    throw NeoDropError.verificationFailed(target.destination.path)
+                }
+                restored = true
+                break
+            } catch {
+                lastError = error
+            }
+        }
+        guard restored else { throw lastError }
+
+        discardRetainedCopies(relativePath: relativePath, config: config)
+        return target.destination
+    }
+
+    /// Hand back the space of deletions whose window has closed: bytes first, then the record.
+    ///
+    /// That order matters. An interrupted purge can then only leave a record whose bytes are
+    /// gone — which the next sync reconciles away — never bytes with no record, which nothing
+    /// would ever find again.
+    @discardableResult
+    public func purgeExpiredDeletions(config: AppConfig) -> Int {
+        let store = DeleteStore(paths: paths)
+        let fm = FileManager.default
+        let now = Date()
+        var purged = 0
+
+        for replica in config.replicas {
+            // An unmounted share must be skipped, not treated as empty: its retained copies are
+            // still there, and dropping the records now would orphan them forever.
+            guard Self.isUsableDirectory(replica.url) else { continue }
+            let records = store.load(replicaID: replica.id)
+            guard records.contains(where: { $0.expiresAt <= now }) else { continue }
+
+            let trashRoot = self.trashRoot(replica.url)
+            var kept: [DeleteRecord] = []
+            var changed = false
+            for record in records {
+                guard record.expiresAt <= now else {
+                    kept.append(record)
+                    continue
+                }
+                let trashURL = record.trashURL(onReplicaRoot: replica.url)
+                guard Self.isInside(trashURL, of: trashRoot) else {
+                    // A record that points outside the trash directory is not ours to act on:
+                    // drop it and never touch the file it names.
+                    changed = true
+                    continue
+                }
+                if fm.fileExists(atPath: trashURL.path), (try? fm.removeItem(at: trashURL)) == nil {
+                    // Could not free the bytes (read-only share, open handle): keep the record and
+                    // retry on the next sync rather than lose track of the copy.
+                    kept.append(record)
+                    continue
+                }
+                purged += 1
+                changed = true
+            }
+            if changed { try? store.save(kept, for: replica.id) }
+        }
+        return purged
+    }
+
+    /// Keep the retention list honest on every sync, whatever `mirrorDeletions` says now:
+    ///
+    /// * a file that is back in the source with the same digest was restored — the deletion is
+    ///   undone, so the record and the retained bytes both go;
+    /// * a record whose retained bytes are missing cannot restore anything, so it is only a dead
+    ///   row in the deleted-files view;
+    /// * a record that points outside the trash directory is never acted on.
+    private func reconcileRetainedCopies(replica: Replica, plan: SourcePlan) {
+        let store = DeleteStore(paths: paths)
+        let records = store.load(replicaID: replica.id)
+        guard !records.isEmpty else { return }
+
+        let fm = FileManager.default
+        let trashRoot = self.trashRoot(replica.url)
+        var changed = false
+        let kept = records.filter { record in
+            let trashURL = record.trashURL(onReplicaRoot: replica.url)
+            guard Self.isInside(trashURL, of: trashRoot) else {
+                changed = true
+                return false
+            }
+            if let back = plan.files[record.relativePath],
+               !record.sha256.isEmpty,
+               back.sha256 == record.sha256 {
+                if fm.fileExists(atPath: trashURL.path), (try? fm.removeItem(at: trashURL)) == nil {
+                    return true
+                }
+                changed = true
+                return false
+            }
+            if !fm.fileExists(atPath: trashURL.path) {
+                changed = true
+                return false
+            }
+            return true
+        }
+        if changed { try? store.save(kept, for: replica.id) }
+    }
+
+    /// Forget a restored file on every destination that still holds it.
+    ///
+    /// Bytes go first and the record second, so an interrupted pass leaves at most a record with
+    /// nothing behind it, which the next sync reconciles away. Unreachable destinations are left
+    /// alone on purpose: their copies are still there, and the next sync drops the record once it
+    /// sees the file back in the source.
+    private func discardRetainedCopies(relativePath: String, config: AppConfig) {
+        let store = DeleteStore(paths: paths)
+        let fm = FileManager.default
+        for replica in config.replicas {
+            guard Self.isUsableDirectory(replica.url) else { continue }
+            let records = store.load(replicaID: replica.id)
+            guard records.contains(where: { $0.relativePath == relativePath }) else { continue }
+
+            let trashRoot = self.trashRoot(replica.url)
+            var kept: [DeleteRecord] = []
+            for record in records where record.relativePath == relativePath {
+                let trashURL = record.trashURL(onReplicaRoot: replica.url)
+                guard Self.isInside(trashURL, of: trashRoot) else { continue }
+                if fm.fileExists(atPath: trashURL.path), (try? fm.removeItem(at: trashURL)) == nil {
+                    kept.append(record)
+                }
+            }
+            kept.append(contentsOf: records.filter { $0.relativePath != relativePath })
+            try? store.save(kept, for: replica.id)
+        }
+    }
+
     // MARK: - Runtime state
 
     private func persistRuntime(summary: SyncSummary, verified: Bool = false) {
@@ -508,6 +858,38 @@ public actor MirrorEngine {
         return isDirectory.boolValue
     }
 
+    /// Where a record's retained bytes live on a replica.
+    private func trashRoot(_ replicaRoot: URL) -> URL {
+        replicaRoot.appendingPathComponent(DeleteRecord.trashDirectoryName, isDirectory: true)
+    }
+
+    /// Guard for every path derived from a record on disk: a hand-edited or corrupt record must
+    /// never be able to point a delete or a restore outside the directory it belongs in.
+    static func isInside(_ child: URL, of root: URL) -> Bool {
+        let childPath = child.standardizedFileURL.path
+        let rootPath = root.standardizedFileURL.path
+        return childPath.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/")
+    }
+
+    /// Where a restore may write: the absolute path recorded at deletion time, or the path
+    /// re-derived from the mirrored name when that record predates a configuration change — but
+    /// only when it lands inside a source root the user still protects.
+    static func restoreTarget(
+        record: DeleteRecord,
+        relativePath: String,
+        config: AppConfig
+    ) -> (destination: URL, source: SourceRoot)? {
+        var candidates = [sourcePath(forMirroredPath: relativePath, config: config)]
+        if !record.sourcePath.isEmpty { candidates.insert(record.sourcePath, at: 0) }
+        for path in candidates where !path.isEmpty {
+            let url = URL(fileURLWithPath: path)
+            for source in config.sources where isInside(url, of: source.url) {
+                return (url, source)
+            }
+        }
+        return nil
+    }
+
     /// Remove now-empty directories that NeoDrop emptied, without ever touching the root.
     static func pruneEmptyDirectories(root: URL, keeping planned: Set<String>) {
         let fm = FileManager.default
@@ -531,6 +913,9 @@ public enum NeoDropError: Error, LocalizedError {
     case verificationFailed(String)
     case noHealthyReplica
     case replicaUnavailable(String)
+    case restoreConflict(String)
+    case restoreSourceUnavailable(String)
+    case retainedCopyUnavailable(String)
 
     public var errorDescription: String? {
         switch self {
@@ -540,6 +925,12 @@ public enum NeoDropError: Error, LocalizedError {
             return "No replica holds a verified copy of this file"
         case .replicaUnavailable(let path):
             return "Replica is not available: \(path)"
+        case .restoreConflict(let path):
+            return "A different file already exists at \(path) — nothing was overwritten"
+        case .restoreSourceUnavailable(let path):
+            return "The original folder is no longer configured, so \(path) has nowhere to go"
+        case .retainedCopyUnavailable(let path):
+            return "No destination holds a verified retained copy of \(path)"
         }
     }
 }
@@ -556,8 +947,16 @@ public struct ReplicaSnapshot: Identifiable, Sendable {
     public var lastVerify: Date?
     public var lastError: String?
 
-    public init(replica: Replica, status: ReplicaStatus, files: Int, bytes: Int64, corrupt: Int,
-                lastSync: Date?, lastVerify: Date?, lastError: String?) {
+    public init(
+        replica: Replica,
+        status: ReplicaStatus,
+        files: Int,
+        bytes: Int64,
+        corrupt: Int,
+        lastSync: Date? = nil,
+        lastVerify: Date? = nil,
+        lastError: String? = nil
+    ) {
         self.replica = replica
         self.status = status
         self.files = files

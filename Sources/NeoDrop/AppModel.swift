@@ -27,10 +27,21 @@ final class AppModel: ObservableObject {
     @Published var launchAtLogin = false
 
     var onOpenSettings: (() -> Void)?
+    var onOpenDeletedFiles: (() -> Void)?
 
     let paths: StorePaths
     let engine: MirrorEngine
     private let configStore: ConfigStore
+
+    /// The loopback page behind “Deleted Files…”. Started once at launch; `deletedFilesURL` is
+    /// what the web view loads, and nil only while the server is coming up or if it failed.
+    private var webServer: WebUIServer?
+    @Published private(set) var deletedFilesURL: URL?
+    /// How many deletions are currently recoverable, for the menu badge.
+    @Published private(set) var deletionCount = 0
+
+    /// The menu item is only useful once there is a page to open.
+    var deletedFilesAvailable: Bool { deletedFilesURL != nil }
 
     private var watcher: FolderWatcher?
     private var timer: Timer?
@@ -57,6 +68,7 @@ final class AppModel: ObservableObject {
         restartWatcher()
         scheduleTimer()
         refreshActivity()
+        startWebUI()
         Task {
             await refresh()
             // A quiet sync on launch closes the gap left by whatever happened while we were off.
@@ -69,6 +81,63 @@ final class AppModel: ObservableObject {
         timer?.invalidate()
         verifyTimer?.invalidate()
         persistTask?.cancel()
+        webServer?.stop()
+        webServer = nil
+        deletedFilesURL = nil
+    }
+
+    // MARK: - Deleted files web UI
+
+    /// Bring up the loopback page the web view loads.
+    ///
+    /// A failure here is not fatal to NeoDrop: mirroring is the product, the deleted-files view
+    /// is a convenience, so it is reported in the log and the menu item stays disabled.
+    private func startWebUI() {
+        guard webServer == nil else { return }
+        let server = WebUIServer(
+            list: { [weak self] in
+                guard let self else { return [] }
+                return await self.deletionEntries()
+            },
+            restore: { [weak self] relativePath in
+                guard let self else { throw NeoDropError.retainedCopyUnavailable(relativePath) }
+                return try await self.restoreDeletion(relativePath)
+            }
+        )
+        webServer = server
+        Task { @MainActor in
+            do {
+                let url = try await server.start()
+                deletedFilesURL = url
+                NeoDropLog.shared.write("Deleted files view ready at \(url.absoluteString)")
+                await refreshDeletionCount()
+            } catch {
+                webServer = nil
+                NeoDropLog.shared.write("Deleted files view unavailable: \(error.localizedDescription)", level: .warning)
+            }
+        }
+    }
+
+    /// Everything the page lists, straight from the engine's records.
+    func deletionEntries() async -> [DeletionEntry] {
+        await engine.listDeletions(config: config)
+    }
+
+    func refreshDeletionCount() async {
+        deletionCount = await deletionEntries().count
+    }
+
+    /// Restore one deletion at the user's request from the web view.
+    ///
+    /// The engine does the work; the app's part is to say so in the log and to re-mirror the file
+    /// immediately, so it lands on every destination rather than at the next scheduled sync.
+    func restoreDeletion(_ relativePath: String) async throws -> URL {
+        let destination = try await engine.restore(relativePath: relativePath, config: config)
+        NeoDropLog.shared.write("Restored \(relativePath) to \(destination.path)", level: .success)
+        banner = "Restored \(destination.lastPathComponent) to its original folder."
+        await refreshDeletionCount()
+        syncNow(reason: "after restoring \(destination.lastPathComponent)")
+        return destination
     }
 
     // MARK: - Actions
@@ -315,6 +384,9 @@ final class AppModel: ObservableObject {
         }
 
         await refresh()
+        // A sync reconciles deletions (restored files drop out of the list, expired ones are
+        // purged), so the count the menu shows is only correct once the sync has finished.
+        await refreshDeletionCount()
         refreshActivity()
 
         if result.isDegraded {

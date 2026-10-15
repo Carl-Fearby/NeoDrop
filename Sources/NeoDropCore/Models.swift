@@ -178,11 +178,123 @@ public struct SourceIndex: Codable, Sendable {
     public var entries: [String: ManifestEntry]
 
     public init(entries: [String: ManifestEntry] = [:]) { self.entries = entries }
+
+    public init() { self.entries = [:] }
+}
+
+// MARK: - Deleted-file retention
+
+/// A file NeoDrop removed from the mirror but is still holding for recovery.
+///
+/// Deletions are recorded instead of destroyed: when a file is gone from every source, each
+/// replica moves its copy into `.neodrop-trash/` at the same relative path and stores a record
+/// here. The bytes are guaranteed until `expiresAt` (30 days after the deletion) — the
+/// "Deleted Files…" web view restores from them — and the purge removes bytes and record
+/// together after that. A record is only ever dropped once its bytes are gone or provably back
+/// in the source, so a retained copy can never be orphaned by cleaning up the list.
+public struct DeleteRecord: Codable, Identifiable, Sendable {
+    public var id: UUID
+    /// The path the file occupied on the mirror (`Photos/a.jpg`) — also its path under `.neodrop-trash/`.
+    public var relativePath: String
+    /// Absolute path in the source folder: where a restore puts the file back. Empty when the
+    /// originating source root was already gone from the configuration at deletion time.
+    public var sourcePath: String
+    public var size: Int64
+    /// Digest of the retained bytes; a restore verifies this before writing anything.
+    public var sha256: String
+    public var deletedAt: Date
+    public var expiresAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        relativePath: String,
+        sourcePath: String,
+        size: Int64,
+        sha256: String,
+        deletedAt: Date = Date(),
+        expiresAt: Date? = nil
+    ) {
+        self.id = id
+        self.relativePath = relativePath
+        self.sourcePath = sourcePath
+        self.size = size
+        self.sha256 = sha256
+        self.deletedAt = deletedAt
+        self.expiresAt = expiresAt ?? deletedAt.addingTimeInterval(Self.retention)
+    }
+
+    /// How long a deletion stays recoverable.
+    public static let retentionDays = 30
+    public static let retention = TimeInterval(retentionDays) * 24 * 60 * 60
+
+    public var isExpired: Bool { Date() >= expiresAt }
+
+    /// The directory on a replica that holds retained copies, hidden and matched by the default
+    /// `.neodrop-*` exclude so it can never be mistaken for mirrored data.
+    public static let trashDirectoryName = ".neodrop-trash"
+
+    /// Where the retained bytes live on a replica whose root is `replicaRoot`.
+    public func trashURL(onReplicaRoot replicaRoot: URL) -> URL {
+        replicaRoot
+            .appendingPathComponent(Self.trashDirectoryName, isDirectory: true)
+            .appendingPathComponent(relativePath)
+    }
+}
+
+/// One destination's stake in a deletion: whether that replica still holds retained bytes.
+public struct DeletionCopy: Codable, Sendable, Equatable {
+    public var replicaID: UUID
+    public var replicaName: String
+    /// False when the destination is unreachable or its retained copy is already gone.
+    public var available: Bool
+
+    public init(replicaID: UUID, replicaName: String, available: Bool) {
+        self.replicaID = replicaID
+        self.replicaName = replicaName
+        self.available = available
+    }
+}
+
+/// One deleted file as the web view sees it: the records of every destination that deleted it,
+/// aggregated. `relativePath` is the identity — each replica records the same logical deletion
+/// independently, moments apart.
+public struct DeletionEntry: Codable, Identifiable, Sendable {
+    public var relativePath: String
+    public var sourcePath: String
+    public var size: Int64
+    public var sha256: String
+    public var deletedAt: Date
+    /// The earliest expiry across copies: once any copy's window closes it may vanish from that replica.
+    public var expiresAt: Date
+    public var copies: [DeletionCopy]
+    /// At least one reachable replica still holds verified-recoverable bytes.
+    ///
+    /// Stored rather than computed: this crosses the wire as JSON to the deleted-files page, and a
+    /// computed property is not encoded — the page would then see `undefined` and leave every
+    /// Restore button disabled. It is derived in `init`, so it cannot disagree with `copies`.
+    public var restorable: Bool
+
+    public var id: String { relativePath }
+
+    public init(relativePath: String, sourcePath: String, size: Int64, sha256: String,
+                deletedAt: Date, expiresAt: Date, copies: [DeletionCopy]) {
+        self.relativePath = relativePath
+        self.sourcePath = sourcePath
+        self.size = size
+        self.sha256 = sha256
+        self.deletedAt = deletedAt
+        self.expiresAt = expiresAt
+        self.copies = copies
+        self.restorable = copies.contains(where: \.available)
+    }
 }
 
 // MARK: - Runtime state
 
 public enum ReplicaStatus: String, Codable, Sendable {
+    // The raw-value Codable conformance is synthesised: decoding maps the stored string through
+    // `init(rawValue:)` and fails loudly on an unknown one, which is exactly the hand-rolled
+    // decoder this file used to carry — twice, which would not compile.
     case unknown
     case online
     case syncing
