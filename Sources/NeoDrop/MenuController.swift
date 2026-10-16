@@ -120,6 +120,7 @@ final class MenuController: NSObject, NSMenuDelegate {
         menu.addItem(replicasMenu())
         menu.addItem(vaultsMenu())
         menu.addItem(activityMenu())
+        add("Open Activity…", #selector(openActivity), key: "a", enabled: true)
 
         menu.addItem(.separator())
         add("Set Up NeoDrop…", #selector(openSetup), key: "", enabled: true)
@@ -375,6 +376,7 @@ final class MenuController: NSObject, NSMenuDelegate {
     @objc private func syncNow() { model.syncNow() }
     @objc private func verifyAll() { model.verifyNow(repair: true) }
     @objc private func openSettings() { model.onOpenSettings?() }
+    @objc private func openActivity() { model.openActivity() }
     @objc private func openDeletedFiles() { model.onOpenDeletedFiles?() }
     @objc private func openFileStatus() { model.onOpenFileStatus?(nil) }
     @objc private func openSetup() { model.onOpenSetup?() }

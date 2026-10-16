@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var deletedFilesWindow: DeletedFilesWindowController?
     private var setupWindow: SetupWindowController?
     private var fileStatusWindow: FileStatusWindowController?
+    private var activityWindow: SyncActivityWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let settings = SettingsWindowController(model: model)
@@ -21,11 +22,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupWindow = setup
         let fileStatus = FileStatusWindowController(model: model)
         fileStatusWindow = fileStatus
+        let activity = SyncActivityWindowController(model: model)
+        activityWindow = activity
         menuController = MenuController(model: model)
         model.onOpenSettings = { [weak settings] in settings?.show() }
         model.onOpenDeletedFiles = { [weak deletedFiles] in deletedFiles?.show() }
         model.onOpenSetup = { [weak setup] in setup?.show() }
         model.onOpenFileStatus = { [weak fileStatus] path in fileStatus?.show(path: path) }
+        model.onOpenActivity = { [weak activity] in activity?.show() }
         model.start()
     }
 
@@ -237,6 +241,34 @@ final class DeletedFilesWindowController: NSObject, WKNavigationDelegate {
         activity log from the menu for the reason.</p>
         </body></html>
         """
+}
+
+/// Native window for live sync progress and recent activity.
+@MainActor
+final class SyncActivityWindowController {
+    private let model: AppModel
+    private var window: NSWindow?
+
+    init(model: AppModel) {
+        self.model = model
+    }
+
+    func show() {
+        if window == nil {
+            let hosting = NSHostingController(rootView: SyncActivityView(model: model))
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "Activity"
+            window.setContentSize(NSSize(width: 720, height: 690))
+            window.minSize = NSSize(width: 580, height: 460)
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.isReleasedWhenClosed = false
+            window.center()
+            self.window = window
+        }
+        model.refreshActivity()
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
 }
 
 /// A plain AppKit window rather than a `Settings` scene, because NeoDrop has no Dock presence

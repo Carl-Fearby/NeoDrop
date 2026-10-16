@@ -37,6 +37,7 @@ final class AppModel: ObservableObject {
     /// Show the status of one file from Finder's Services menu. A nil path asks the user which file;
     /// that is what the menu item does.
     var onOpenFileStatus: ((String?) -> Void)?
+    var onOpenActivity: (() -> Void)?
 
     let paths: StorePaths
     let engine: MirrorEngine
@@ -235,7 +236,7 @@ final class AppModel: ObservableObject {
         guard !isBusy else { return }
         isBusy = true
         progress = SyncProgress(phase: .scanning)
-        NeoDropLog.shared.write("Syncing “\(link.displayName)”")
+        NeoDropLog.shared.write("Syncing “\(link.displayName)”", scope: .shared)
         Task {
             await reconcileVaults(reason: "manual", only: [link.id])
             isBusy = false
@@ -262,9 +263,11 @@ final class AppModel: ObservableObject {
             status.summary = summary
             vaultStatuses[link.id] = status
 
-            NeoDropLog.shared.write(Self.describe(summary, link: link), level: summary.isDegraded ? .warning : .success)
+            NeoDropLog.shared.write(Self.describe(summary, link: link),
+                                    level: summary.isDegraded ? .warning : .success,
+                                    scope: .shared)
             for error in summary.errors.prefix(5) {
-                NeoDropLog.shared.write("\(link.displayName): \(error)", level: .warning)
+                NeoDropLog.shared.write("\(link.displayName): \(error)", level: .warning, scope: .shared)
             }
             if summary.seeded {
                 banner = "\(link.displayName): pulled \(summary.downloaded) file(s) from the vault on this Mac's first sync."
@@ -573,15 +576,11 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// The one-line description of the pass running now, or nil when nothing is running. The
+    /// wording lives in `ActivityFeed` so the menu, the window and their tests agree on it.
     var progressLine: String? {
         guard isBusy else { return nil }
-        var parts: [String] = [progress.phase.label]
-        if let name = progress.replicaName { parts.append("→ \(name)") }
-        if progress.filesTotal > 0 {
-            parts.append("\(progress.filesDone)/\(progress.filesTotal) files")
-        }
-        if let file = progress.currentFile { parts.append(file) }
-        return parts.joined(separator: " · ")
+        return ActivityFeed.progressLine(progress)
     }
 
     var lastSyncDescription: String {
@@ -610,6 +609,11 @@ final class AppModel: ObservableObject {
 
     func refreshActivity() {
         activity = NeoDropLog.shared.recent(40).reversed()
+    }
+
+    func openActivity() {
+        refreshActivity()
+        onOpenActivity?()
     }
 
     func refresh() async {
@@ -825,11 +829,5 @@ extension ReplicaStatus {
         case .offline: return "offline"
         case .disabled: return "disabled"
         }
-    }
-}
-
-extension Int64 {
-    var byteDescription: String {
-        ByteCountFormatter.string(fromByteCount: self, countStyle: .file)
     }
 }

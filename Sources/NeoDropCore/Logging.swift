@@ -8,6 +8,20 @@ public enum LogLevel: String, Sendable {
     case success = "OK"
 }
 
+/// Which part of the setup a log line is about.
+///
+/// The Activity window's two tabs are decided by this, and by nothing else. They used to be decided
+/// by searching the message for the words "vault" and "two-way", which made the Shared tab a guess
+/// about English: the line a two-way folder writes — "Shared: 2 sent, 1 received" — contains
+/// neither word, so the tab that exists to show that work showed none of it. Whoever writes a line
+/// knows what it is about; this is where they say so.
+public enum LogScope: String, Sendable {
+    /// The folders on this Mac, the one-way mirrors, and the app itself.
+    case local
+    /// Work that involves a two-way folder: the vault on the share, and what it did.
+    case shared
+}
+
 /// Append-only log: a ring buffer for the menu, a file for after-the-fact debugging.
 public final class NeoDropLog: @unchecked Sendable {
     public static let shared = NeoDropLog()
@@ -26,6 +40,7 @@ public final class NeoDropLog: @unchecked Sendable {
         public let id = UUID()
         public let date: Date
         public let level: LogLevel
+        public let scope: LogScope
         public let message: String
 
         public var line: String {
@@ -39,8 +54,8 @@ public final class NeoDropLog: @unchecked Sendable {
         }()
     }
 
-    public func write(_ message: String, level: LogLevel = .info) {
-        let entry = LogEntry(date: Date(), level: level, message: message)
+    public func write(_ message: String, level: LogLevel = .info, scope: LogScope = .local) {
+        let entry = LogEntry(date: Date(), level: level, scope: scope, message: message)
         queue.async { [weak self] in
             guard let self else { return }
             self.buffer.append(entry)
