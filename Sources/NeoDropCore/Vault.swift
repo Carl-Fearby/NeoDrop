@@ -525,12 +525,37 @@ public struct VaultCursor: Codable, Sendable {
     /// Canonical path -> content hash both sides agreed on. `""` means "agreed that it is gone".
     public var applied: [String: String]
     public var lastSync: Date?
+    /// Last path processed in a bounded catch-up pass. Nil means the current tree was fully walked.
+    public var catchUpAfter: String?
+    /// Changed paths discovered behind the page cursor, carried forward until reconciled.
+    public var catchUpDirtyPaths: [String]?
+    /// The newest journal entry this machine has finished a pass over, in milliseconds since 1970.
+    ///
+    /// Milliseconds rather than a `Date` on purpose: this file is written as ISO-8601 to whole
+    /// seconds while the journal keeps milliseconds, so an entry published in the same second this
+    /// pass finished would compare as *newer* than a whole-second watermark and be re-checked for
+    /// ever. An integer round-trips exactly.
+    ///
+    /// It is a heuristic, and it only decides what is re-checked *early*: a change the page walk
+    /// has left behind is picked up by the next walk over the tree regardless of what this says.
+    public var catchUpSeenAt: Int64?
 
-    public init(vaultID: UUID, machineID: UUID, applied: [String: String] = [:], lastSync: Date? = nil) {
+    public init(
+        vaultID: UUID,
+        machineID: UUID,
+        applied: [String: String] = [:],
+        lastSync: Date? = nil,
+        catchUpAfter: String? = nil,
+        catchUpDirtyPaths: [String]? = nil,
+        catchUpSeenAt: Int64? = nil
+    ) {
         self.vaultID = vaultID
         self.machineID = machineID
         self.applied = applied
         self.lastSync = lastSync
+        self.catchUpAfter = catchUpAfter
+        self.catchUpDirtyPaths = catchUpDirtyPaths
+        self.catchUpSeenAt = catchUpSeenAt
     }
 }
 

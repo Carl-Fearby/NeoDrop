@@ -260,6 +260,13 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// How many bounded passes one sync may take over a single two-way folder.
+    ///
+    /// At 500 paths a pass this moves 10,000 paths in a sync, which covers a folder of any size a
+    /// person keeps on a share. A tree larger than that keeps its cursor and finishes on the next
+    /// scheduled sync rather than making the menu hang on one unbounded walk.
+    private static let maxCatchUpPasses = 20
+
     /// Sync one two-way folder now, without waiting for the schedule. Used by the menu item that
     /// sits under a single folder, where "Sync Now" at the top level would be the wrong scope.
     func syncVaultNow(_ link: VaultLink) {
@@ -281,10 +288,31 @@ final class AppModel: ObservableObject {
         progress = SyncProgress(phase: .scanning)
 
         for link in links {
-            let summary = await vaultEngine.reconcile(link: link, config: config) { [weak self] update in
+            // One pass covers a bounded page of the tree. Keep taking passes while a cursor says
+            // more is due, so a folder with a few thousand files converges in the sync the user
+            // asked for instead of one page per timer tick. The budget is there because a sync
+            // must always end: whatever is left is picked up by the next one.
+            var summary = await vaultEngine.reconcile(link: link, config: config) { [weak self] update in
                 Task { @MainActor in self?.progress = update }
             }
+            var passes = 1
+            while let accumulated = summary, accumulated.catchUpPending, passes < Self.maxCatchUpPasses {
+                guard let next = await vaultEngine.reconcile(link: link, config: config, progress: { [weak self] update in
+                    Task { @MainActor in self?.progress = update }
+                }) else { break }
+                var folded = accumulated
+                folded.absorb(next)
+                summary = folded
+                passes += 1
+            }
             guard let summary else { continue }
+            if summary.catchUpPending {
+                NeoDropLog.shared.write(
+                    "\(link.displayName): still catching up after \(passes) passes — the rest continues on the next sync",
+                    level: .warning,
+                    scope: .shared
+                )
+            }
 
             var status = vaultStatuses[link.id] ?? VaultStatus(link: link)
             status.link = link
@@ -332,6 +360,7 @@ final class AppModel: ObservableObject {
         if !summary.repairs.isEmpty { line += ", \(summary.repairs.count) repaired on the share" }
         if summary.adoptedInVault > 0 { line += ", \(summary.adoptedInVault) adopted from the share" }
         if summary.seeded { line += " (first sync on this Mac)" }
+        if summary.catchUpPending { line += ", still catching up" }
         if summary.changes == 0 && summary.errors.isEmpty { line += " — up to date" }
         return line
     }

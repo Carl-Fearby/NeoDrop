@@ -38,6 +38,10 @@ public struct VaultSyncSummary: Sendable {
     public var errors: [String] = []
     /// True when this machine had never synced this vault and pulled the tree down.
     public var seeded = false
+    /// More paths remain after this bounded pass; the next scheduled/manual sync resumes it.
+    public var catchUpPending = false
+    /// Number of paths included in this reconcile pass.
+    public var catchUpProcessed = 0
 
     public init(vaultID: UUID, vaultName: String, machineName: String, phase: SyncPhase, startedAt: Date) {
         self.vaultID = vaultID
@@ -51,6 +55,37 @@ public struct VaultSyncSummary: Sendable {
     public var duration: TimeInterval { finishedDate.timeIntervalSince(startedAt) }
     public var changes: Int { uploaded + downloaded + remoteDeletionsApplied + localDeletionsPublished }
     public var isDegraded: Bool { !errors.isEmpty }
+
+    /// Fold a later pass of the same sync into this one.
+    ///
+    /// A pass over a tree larger than `catchUpBatchSize` covers only a page of it, and the caller
+    /// keeps calling until `catchUpPending` is false. That is one sync from the user's side, so it
+    /// has to be counted and reported as one: without this, a folder of 2,000 files would report
+    /// "500 sent" at the end of the sync that actually sent 2,000.
+    public mutating func absorb(_ later: VaultSyncSummary) {
+        uploaded += later.uploaded
+        downloaded += later.downloaded
+        remoteDeletionsApplied += later.remoteDeletionsApplied
+        localDeletionsPublished += later.localDeletionsPublished
+        versionsRetained += later.versionsRetained
+        versionsPurged += later.versionsPurged
+        conflicts += later.conflicts
+        repairs += later.repairs
+        undeleted += later.undeleted
+        adoptedInVault += later.adoptedInVault
+        upToDate += later.upToDate
+        bytesUp += later.bytesUp
+        bytesDown += later.bytesDown
+        errors += later.errors
+        catchUpProcessed += later.catchUpProcessed
+        seeded = seeded || later.seeded
+        // The last pass has the final word on these: they describe what is true now, not what each
+        // page added on the way.
+        catchUpPending = later.catchUpPending
+        filesInVault = later.filesInVault
+        phase = later.phase
+        finishedAt = later.finishedAt
+    }
 }
 
 public enum VaultError: Error, LocalizedError {
@@ -88,6 +123,9 @@ public enum VaultError: Error, LocalizedError {
 /// `.neodrop/versions/`, locally in `.neodrop-trash/` with a record), and the losing side of a
 /// conflict is kept as a conflicted copy.
 public actor VaultSync {
+    /// Maximum number of paths reconciled in one pass. A saved cursor resumes later work.
+    public static let catchUpBatchSize = 500
+
     private let paths: StorePaths
     private let machineStore: MachineIdentityStore
     private let cursorStore: VaultCursorStore
@@ -171,6 +209,7 @@ public actor VaultSync {
         }
         let firstSync = cursor.applied.isEmpty
         var base = cursor.applied
+        let existingJournalKeys = Set(state.files.keys)
         var reserved: Set<String> = []
 
         // MARK: scan local
@@ -192,14 +231,22 @@ public actor VaultSync {
             return finish(&summary, phase: .failed("The local folder could not be read"), error: error)
         }
 
-        let refreshed = indexer.refresh(files: scanned, previous: indexStore.load())
-        summary.errors.append(contentsOf: refreshed.errors)
-        try? indexStore.save(refreshed.index)
+        let orderedScanned = scanned.sorted { VaultPath.key($0.relativePath) < VaultPath.key($1.relativePath) }
+        let previousIndex = indexStore.load()
+        let indexed = indexer.refresh(files: orderedScanned, previous: previousIndex)
+        summary.errors.append(contentsOf: indexed.errors)
+        let localIndexChangedPaths = Set(orderedScanned.compactMap { file -> String? in
+            let indexKey = "\(file.sourceID.uuidString)/\(file.relativePath)"
+            guard let newEntry = indexed.index.entries[indexKey] else { return nil }
+            guard let oldEntry = previousIndex.entries[indexKey],
+                  oldEntry.sha256 != newEntry.sha256 else { return nil }
+            return VaultPath.key(file.relativePath)
+        })
 
         var local: [String: (file: ScannedFile, sha: String)] = [:]
-        for file in scanned {
+        for file in orderedScanned {
             let indexKey = "\(file.sourceID.uuidString)/\(file.relativePath)"
-            guard let entry = refreshed.index.entries[indexKey], !entry.sha256.isEmpty else { continue }
+            guard let entry = indexed.index.entries[indexKey], !entry.sha256.isEmpty else { continue }
             local[VaultPath.key(file.relativePath)] = (file, entry.sha256)
         }
 
@@ -220,7 +267,7 @@ public actor VaultSync {
         let pendingUndeletes = undeletes.load(linkID: link.id)
         var journal = JournalWriter(seq: store.nextSequence(machineID: machine.id.uuidString))
         var adopted = 0
-        for path in store.untrackedFiles(known: Set(state.files.keys), excludes: excludes) {
+        for path in store.untrackedFiles(known: existingJournalKeys, excludes: excludes) {
             let key = VaultPath.key(path)
             guard local[key] == nil else { continue }
             let url = store.fileURL(for: path)
@@ -236,14 +283,65 @@ public actor VaultSync {
         summary.adoptedInVault = adopted
 
         // MARK: plan
-        let keys = Set(state.files.keys).union(state.tombstones.keys).union(local.keys).union(base.keys)
+        let allKeys = Set(state.files.keys).union(state.tombstones.keys).union(local.keys).union(base.keys)
+        let orderedKeys = allKeys.sorted()
+        let cursorStart = cursor.catchUpAfter
+        let catchUpKeys = orderedKeys.filter { key in
+            guard let cursorStart else { return true }
+            return key > cursorStart
+        }
+        // Paths that need a look the forward walk will not give them.
+        //
+        // The saved cursor is what makes a pass over a large tree cheap, and it is also what makes
+        // a path behind it invisible: until the walk finishes, nothing at or before the cursor is
+        // ever visited again. Anything that changed since this machine's last pass therefore has
+        // to be named here or it is skipped for good:
+        //
+        // * what changed in this folder — a local edit is the one change no journal announces;
+        // * what changed in the vault on another machine, which the page would walk straight past;
+        // * whatever a previous pass could not fit into its batch.
+        let dirtyBefore = Set(cursor.catchUpDirtyPaths ?? [])
+        let changedLocalKeys = Set(base.keys).filter { local[$0]?.sha != base[$0] }
+        let watermark = cursor.catchUpSeenAt
+        let changedInVaultKeys = Set(state.files.keys).union(state.tombstones.keys).filter { key in
+            guard let watermark else { return false }
+            // Only content this machine has not already agreed to: a path it is ahead of (or in
+            // conflict over) is not "dirty", it is this machine's own work.
+            if let entry = state.files[key] {
+                return Self.millis(entry.at) > watermark && entry.sha256 != base[key]
+            }
+            guard let gone = state.tombstones[key] else { return false }
+            // A tombstone says the path is gone, which the base spells as an empty digest.
+            return Self.millis(gone.at) > watermark && base[key] != ""
+        }
+        let dirtyNow = dirtyBefore
+            .union(changedLocalKeys)
+            .union(localIndexChangedPaths)
+            .union(changedInVaultKeys)
+
+        // The forward walk, with room made for the dirty paths it would not reach: those behind
+        // the cursor, and those past its cut. Dropping the page's *last* keys is what keeps that
+        // safe — the cursor then stops short of them, so the next pass picks them up instead of
+        // stepping over them. Never more than half the batch, so a page still moves forward even
+        // when a great many paths are dirty.
+        let behind = dirtyNow.subtracting(catchUpKeys.prefix(VaultSync.catchUpBatchSize))
+        let displaced = min(behind.count, VaultSync.catchUpBatchSize / 2)
+        let page = Array(catchUpKeys.prefix(VaultSync.catchUpBatchSize - displaced))
+        let filled = behind.sorted().prefix(VaultSync.catchUpBatchSize - page.count)
+        let batchKeys = Set(page).union(filled).sorted()
+        // A path the vault changed since the last pass is carried one pass further on purpose: a
+        // change that lands *while* this pass runs arrives after the journal was read, so the path
+        // is re-checked rather than assumed handled. The watermark moves forward, so it clears
+        // itself on the next pass instead of accumulating.
+        let dirtyAfter = dirtyNow.subtracting(batchKeys).union(changedInVaultKeys)
+        let catchUpPending = catchUpKeys.count > page.count || !dirtyAfter.isEmpty || (cursorStart != nil && adopted > 0)
         let deleteStore = DeleteStore(paths: paths)
         reconcileLocalDeleteRecords(link: link, local: local, deleteStore: deleteStore)
 
         // Deletions a remote machine published, gathered before anything is applied: a batch that
         // would empty this folder is exactly what the bulk guard is for, and refusing is the safe
         // outcome (both sides keep their data and the user is told).
-        let remoteDeletions = keys.filter { key in
+        let remoteDeletions = batchKeys.filter { key in
             state.tombstones[key] != nil && local[key] != nil && base[key] == local[key]?.sha
         }
         var holdRemoteDeletions = false
@@ -257,7 +355,7 @@ public actor VaultSync {
                 "Held back \(remoteDeletions.count) deletion(s) another machine made: that is more than a quarter of this vault. Tick “Allow bulk deletions” in Settings if it was meant."
             )
         }
-        let localDeletions = keys.filter { key in
+        let localDeletions = batchKeys.filter { key in
             state.files[key] != nil && local[key] == nil && base[key] == state.files[key]?.sha256 && base[key] != nil
         }
         var holdLocalDeletions = false
@@ -274,22 +372,26 @@ public actor VaultSync {
 
         // MARK: execute
         var bytesTotal: Int64 = 0
-        for (key, entry) in state.files {
-            if local[key]?.sha != entry.sha256, base[key] != entry.sha256 { bytesTotal += entry.size }
+        for key in batchKeys {
+            if let entry = state.files[key], local[key]?.sha != entry.sha256, base[key] != entry.sha256 {
+                bytesTotal += entry.size
+            }
+            if let item = local[key], state.files[key]?.sha256 != item.sha { bytesTotal += item.file.size }
         }
-        for (key, item) in local where state.files[key]?.sha256 != item.sha { bytesTotal += item.file.size }
 
         var doneFiles = 0
         var doneBytes: Int64 = 0
-        defer { progress(SyncProgress(phase: .syncing, filesTotal: keys.count, filesDone: keys.count, bytesTotal: bytesTotal, bytesDone: bytesTotal)) }
+        defer { progress(SyncProgress(phase: .syncing, filesTotal: batchKeys.count, filesDone: batchKeys.count, bytesTotal: bytesTotal, bytesDone: bytesTotal)) }
+        summary.catchUpProcessed = batchKeys.count
+        summary.catchUpPending = catchUpPending
 
-        for key in keys.sorted() {
+        for key in batchKeys {
             doneFiles += 1
             progress(SyncProgress(
                 phase: .syncing,
                 replicaName: link.displayName,
                 currentFile: state.files[key]?.path ?? local[key]?.file.relativePath ?? key,
-                filesTotal: keys.count,
+                filesTotal: batchKeys.count,
                 filesDone: doneFiles,
                 bytesTotal: bytesTotal,
                 bytesDone: doneBytes
@@ -477,17 +579,42 @@ public actor VaultSync {
         let keep = store.retainableVersions(from: loaded.entries, within: DeleteRecord.retention, now: now)
         summary.versionsPurged = store.purgeVersions(keeping: keep, olderThan: DeleteRecord.retention, now: now)
 
-        // A marker is only useful while the journal still calls that path deleted.
-        undeletes.prune(keeping: Set(state.tombstones.keys), linkID: link.id)
+        if summary.errors.isEmpty {
+            // A marker is only useful while the journal still calls that path deleted.
+            undeletes.prune(keeping: Set(state.tombstones.keys), linkID: link.id)
+        }
 
-        cursor.applied = base
-        cursor.lastSync = now
-        try? cursorStore.save(cursor)
+        // Publish the range's durable operations before committing its cursor. If appending the
+        // journal fails, preserve the previous checkpoint so the range will be retried.
+        // Commit merge-base and checkpoint only when all selected operations succeeded.
+        // Otherwise the previous cursor stays intact and this whole batch is safely retried.
+        if summary.errors.isEmpty {
+            cursor.applied = base
+            cursor.catchUpAfter = catchUpPending ? (page.last ?? cursorStart) : nil
+            cursor.catchUpDirtyPaths = dirtyAfter.isEmpty ? nil : dirtyAfter.sorted()
+            // What the journal held when this pass finished, so the next one can tell what arrived
+            // while it was behind without trusting two differently-rounded timestamps.
+            cursor.catchUpSeenAt = max(cursor.catchUpSeenAt ?? 0, loaded.entries.map { Self.millis($0.at) }.max() ?? 0)
+            cursor.lastSync = now
+            do {
+                try cursorStore.save(cursor)
+                var committedIndex = previousIndex
+                for key in batchKeys {
+                    guard let file = local[key]?.file else { continue }
+                    let indexKey = "\(file.sourceID.uuidString)/\(file.relativePath)"
+                    if let entry = indexed.index.entries[indexKey] { committedIndex.entries[indexKey] = entry }
+                }
+                try indexStore.save(committedIndex)
+            } catch {
+                summary.errors.append("Could not save sync progress: \(error.localizedDescription)")
+            }
+        }
         // What the vault holds now: the merged state, adjusted by what this run published. Taken
         // from the journal entries rather than assumed, so the menu number matches the share.
         summary.filesInVault = state.fileCount
             + journal.entries.filter { $0.kind == .create }.count
             - journal.entries.filter { $0.kind == .delete }.count
+        summary.catchUpPending = catchUpPending || (!summary.errors.isEmpty && !batchKeys.isEmpty)
 
         // Deliberately no `pruneEmptyDirectories` here. On a replica an empty directory is
         // leftovers to tidy; the local side of a two-way folder is the folder a person works in,
@@ -497,6 +624,13 @@ public actor VaultSync {
     }
 
     // MARK: - Actions
+
+    /// A journal timestamp as an exact integer, so comparing one against a stored watermark does
+    /// not depend on how either was written to disk. The journal keeps milliseconds; this keeps
+    /// them too.
+    static func millis(_ date: Date) -> Int64 {
+        Int64((date.timeIntervalSince1970 * 1000).rounded())
+    }
 
     /// Keep this machine's retention list honest, the same way the mirror engine does.
     ///

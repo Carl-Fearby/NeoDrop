@@ -656,6 +656,211 @@ final class VaultSyncTests: XCTestCase {
 
     // MARK: - Journalling
 
+    func testLongOfflineCatchUpResumesInBoundedBatchesAndConverges() async throws {
+        let total = VaultSync.catchUpBatchSize + 23
+        for index in 0..<total {
+            try sandbox.write("payload \(index)", machine: 0, to: String(format: "file-%04d.txt", index))
+        }
+        let firstPublisherPass = try await sandbox.sync(0)
+        XCTAssertTrue(firstPublisherPass.catchUpPending)
+        let publisherRemainder = try await sandbox.sync(0)
+        XCTAssertFalse(publisherRemainder.catchUpPending)
+
+        let firstPass = try await sandbox.sync(1)
+        XCTAssertEqual(firstPass.catchUpProcessed, VaultSync.catchUpBatchSize)
+        XCTAssertTrue(firstPass.catchUpPending)
+        XCTAssertEqual(sandbox.localFiles(machine: 1).count, VaultSync.catchUpBatchSize)
+
+        // Recreate the engine to prove the page boundary is durable, not actor memory.
+        let resumed = try await sandbox.sync(1)
+        XCTAssertEqual(resumed.catchUpProcessed, 23, resumed.errors.joined(separator: "; "))
+        XCTAssertFalse(resumed.catchUpPending)
+        XCTAssertEqual(sandbox.localFiles(machine: 1).count, total)
+        XCTAssertEqual(Set(sandbox.localFiles(machine: 1)), Set(sandbox.localFiles(machine: 0)))
+        let vaultID = try XCTUnwrap(VaultStore(root: sandbox.vault).loadIdentity()?.id)
+        let cursor = try XCTUnwrap(VaultCursorStore(paths: sandbox.machines[1].state).load(vaultID: vaultID))
+        XCTAssertNil(cursor.catchUpAfter)
+    }
+
+    func testInterruptedCatchUpRetriesMissingVaultContentWithoutSkippingCheckpoint() async throws {
+        let count = VaultSync.catchUpBatchSize + 23
+        for index in 0..<count {
+            try sandbox.write("payload \(index)", machine: 0, to: String(format: "file-%04d.txt", index))
+        }
+        let publisherFirstPass = try await sandbox.sync(0)
+        XCTAssertTrue(publisherFirstPass.catchUpPending)
+        let publisherRemainder = try await sandbox.sync(0)
+        XCTAssertFalse(publisherRemainder.catchUpPending)
+
+        let firstBatch = try await sandbox.sync(1)
+        XCTAssertTrue(firstBatch.catchUpPending)
+        XCTAssertEqual(sandbox.localFiles(machine: 1).count, VaultSync.catchUpBatchSize)
+        let vaultID = try XCTUnwrap(VaultStore(root: sandbox.vault).loadIdentity()?.id)
+        let cursorStore = VaultCursorStore(paths: sandbox.machines[1].state)
+        let firstCursor = try XCTUnwrap(cursorStore.load(vaultID: vaultID))
+        XCTAssertEqual(firstCursor.catchUpAfter, "file-0499.txt")
+
+        // While B is behind the page cursor, A updates an unvisited file. B must retain the dirty
+        // path checkpoint even after advancing the current page, then reconcile that path later.
+        try sandbox.write("edited on A", machine: 0, to: "file-0500.txt")
+        let published = try await sandbox.sync(0)
+        XCTAssertEqual(published.uploaded, 1)
+        let publisherRemainderAfterEdit = try await sandbox.sync(0)
+        XCTAssertFalse(publisherRemainderAfterEdit.catchUpPending)
+
+        let resumed = try await sandbox.sync(1)
+        XCTAssertEqual(resumed.catchUpProcessed, 23)
+        XCTAssertTrue(resumed.catchUpPending)
+        XCTAssertEqual(try sandbox.read(machine: 1, "file-0500.txt"), "edited on A")
+        let heldCursor = try XCTUnwrap(cursorStore.load(vaultID: vaultID))
+        XCTAssertEqual(heldCursor.catchUpAfter, "file-0522.txt")
+        XCTAssertEqual(heldCursor.catchUpDirtyPaths, ["file-0500.txt"])
+
+        let retry = try await sandbox.sync(1)
+        XCTAssertTrue(retry.errors.isEmpty, retry.errors.joined(separator: "; "))
+        XCTAssertFalse(retry.catchUpPending)
+        XCTAssertEqual(sandbox.localFiles(machine: 1).count, count)
+        let finalCursor = try XCTUnwrap(cursorStore.load(vaultID: vaultID))
+        XCTAssertNil(finalCursor.catchUpAfter)
+    }
+
+    /// A relaunch in the middle of a catch-up has to pick the walk up where the file left it.
+    ///
+    /// Every `sandbox.sync` builds a new engine, which is what a launch does, so these passes prove
+    /// what the *cursor on disk* says rather than what an actor remembers. The app takes passes in a
+    /// loop until the cursor clears (`AppModel.maxCatchUpPasses`), so that is what this does: the
+    /// second pass must not lose the paths it had not read, and must not re-read the ones it had.
+    /// That difference is the entire reason for keeping a cursor, and neither half of it is visible
+    /// from a summary that only counted work.
+    func testRelaunchingMidCatchUpResumesFromTheCursorWithoutRedoingTheWork() async throws {
+        let total = VaultSync.catchUpBatchSize + 23
+        for index in 0..<total {
+            try sandbox.write("payload \(index)", machine: 0, to: String(format: "file-%04d.txt", index))
+        }
+        try await sandbox.sync(0)
+        try await sandbox.sync(0)
+
+        let firstRun = try await sandbox.sync(1)
+        XCTAssertEqual(firstRun.downloaded, VaultSync.catchUpBatchSize)
+        XCTAssertTrue(firstRun.catchUpPending)
+        XCTAssertEqual(sandbox.localFiles(machine: 1).count, VaultSync.catchUpBatchSize)
+        XCTAssertEqual(sandbox.journalLines(machine: 1).count, 0,
+                       "applying another machine's content is not this machine publishing")
+
+        // Quit and start again: a fresh engine, the same state directory.
+        let resumed = try await sandbox.sync(1)
+        XCTAssertEqual(resumed.downloaded, 23, "only the paths the cursor had not reached")
+        XCTAssertEqual(resumed.upToDate, 0, "the paths before the cursor were not walked again")
+        XCTAssertEqual(resumed.uploaded, 0, "and were not republished")
+        XCTAssertEqual(resumed.errors, [])
+        XCTAssertFalse(resumed.catchUpPending, "the walk is finished")
+        XCTAssertEqual(sandbox.localFiles(machine: 1).count, total)
+        XCTAssertEqual(sandbox.localFiles(machine: 1), sandbox.localFiles(machine: 0))
+
+        // The bytes that moved are the remainder and nothing else: the 500 files the first pass
+        // applied were left alone rather than hashed and written again.
+        let remainderBytes = (VaultSync.catchUpBatchSize..<total).reduce(Int64(0)) { running, index in
+            running + Int64("payload \(index)".utf8.count)
+        }
+        XCTAssertEqual(resumed.bytesDown, remainderBytes,
+                       "moved \(resumed.bytesDown) bytes for a 23-file remainder")
+        XCTAssertGreaterThan(resumed.bytesDown, 0, "the remainder really did move")
+
+        // An idle pass afterwards moves nothing, and the cleared cursor makes it walk from the top
+        // again — bounded, and finding every path already agreed on.
+        let settled = try await sandbox.sync(1)
+        XCTAssertEqual(settled.downloaded, 0)
+        XCTAssertEqual(settled.uploaded, 0)
+        XCTAssertEqual(settled.catchUpProcessed, VaultSync.catchUpBatchSize)
+        XCTAssertEqual(settled.upToDate, VaultSync.catchUpBatchSize)
+        XCTAssertEqual(sandbox.localFiles(machine: 1).count, total)
+    }
+
+    /// A deletion is the other thing a cursor can walk past, and the more dangerous one: a file the
+    /// page never revisits is a file the user deleted on one Mac that stays on the other for ever.
+    /// One deletion behind the cursor (a path this machine has already applied) and one ahead of it
+    /// (a path it has not reached) both have to land on this machine's next pass.
+    func testADeletionBehindThePageCursorIsAppliedOnTheNextPass() async throws {
+        let total = VaultSync.catchUpBatchSize + 23
+        for index in 0..<total {
+            try sandbox.write("payload \(index)", machine: 0, to: String(format: "file-%04d.txt", index))
+        }
+        try await sandbox.sync(0)
+        try await sandbox.sync(0)
+
+        let firstBatch = try await sandbox.sync(1)
+        XCTAssertEqual(firstBatch.downloaded, VaultSync.catchUpBatchSize)
+        XCTAssertEqual(sandbox.localFiles(machine: 1).count, VaultSync.catchUpBatchSize)
+        let vaultID = try XCTUnwrap(VaultStore(root: sandbox.vault).loadIdentity()?.id)
+        let cursorStore = VaultCursorStore(paths: sandbox.machines[1].state)
+        XCTAssertEqual(try XCTUnwrap(cursorStore.load(vaultID: vaultID)).catchUpAfter, "file-0499.txt")
+
+        // A deletes one file B already has (behind its cursor) and one it never reached (ahead of
+        // it). Both are gone from the share, and both ways of being deleted have to reach B.
+        let digest = try Hashing.sha256(ofFileAt: sandbox.machines[1].local.appendingPathComponent("file-0010.txt"))
+        try sandbox.delete(machine: 0, "file-0010.txt")
+        try sandbox.delete(machine: 0, "file-0500.txt")
+        let published = try await sandbox.sync(0)
+        XCTAssertEqual(published.localDeletionsPublished, 2)
+        XCTAssertFalse(sandbox.vaultExists("file-0010.txt"))
+        XCTAssertFalse(sandbox.vaultExists("file-0500.txt"))
+
+        let resumed = try await sandbox.sync(1)
+        XCTAssertEqual(resumed.remoteDeletionsApplied, 1,
+                       "only the one this machine actually held: the other it had never downloaded")
+        XCTAssertFalse(sandbox.exists(machine: 1, "file-0010.txt"))
+        XCTAssertFalse(sandbox.exists(machine: 1, "file-0500.txt"))
+        XCTAssertEqual(sandbox.trashFiles(machine: 1), ["file-0010.txt"])
+        let trashed = DeleteRecord(relativePath: "file-0010.txt", sourcePath: "", size: 0, sha256: "")
+            .trashURL(onReplicaRoot: sandbox.machines[1].local)
+        XCTAssertEqual(try Hashing.sha256(ofFileAt: trashed), digest,
+                       "the bytes are kept, so the deletion is recoverable on this machine too")
+
+        // The page from the cursor covered everything left in the tree, and the deletion behind it
+        // took a seat in the same batch — there was room, because a short page leaves room. Both
+        // deletions are then carried one pass further, because the vault changed them while this
+        // machine was mid-walk and a change that lands then is re-checked rather than assumed.
+        let held = try XCTUnwrap(cursorStore.load(vaultID: vaultID))
+        XCTAssertEqual(held.catchUpAfter, "file-0522.txt", "the page reached the end of the tree")
+        XCTAssertEqual(held.catchUpDirtyPaths, ["file-0010.txt", "file-0500.txt"])
+        XCTAssertTrue(resumed.catchUpPending)
+
+        let settled = try await sandbox.sync(1)
+        XCTAssertFalse(settled.catchUpPending)
+        XCTAssertEqual(settled.remoteDeletionsApplied, 0, "an applied deletion is not applied again")
+        XCTAssertEqual(settled.errors, [])
+        XCTAssertNil(try XCTUnwrap(cursorStore.load(vaultID: vaultID)).catchUpAfter)
+        XCTAssertEqual(sandbox.localFiles(machine: 1), sandbox.localFiles(machine: 0))
+        XCTAssertEqual(sandbox.localFiles(machine: 1).count, total - 2)
+    }
+
+    /// The pattern the app uses: take bounded passes and fold them into one summary until the
+    /// cursor clears. A folder of 2,000 files has to be *reported* as 2,000 files, not as whatever
+    /// the last page happened to hold — the menu and the log are one sync to the user.
+    func testFoldingThePassesOfOneSyncReportsTheWholeSync() async throws {
+        let total = VaultSync.catchUpBatchSize + 5
+        for index in 0..<total {
+            try sandbox.write("payload \(index)", machine: 0, to: String(format: "file-%04d.txt", index))
+        }
+
+        let engine = sandbox.engine(0)
+        var summary = try unwrap(await engine.reconcile(link: sandbox.link(0), config: sandbox.config()))
+        var passes = 1
+        while summary.catchUpPending {
+            let next = try unwrap(await engine.reconcile(link: sandbox.link(0), config: sandbox.config()))
+            summary.absorb(next)
+            passes += 1
+            XCTAssertLessThan(passes, 10, "a bounded walk must finish a 505-path tree in two passes")
+        }
+
+        XCTAssertEqual(passes, 2)
+        XCTAssertEqual(summary.catchUpProcessed, total)
+        XCTAssertEqual(summary.uploaded, total, "the folded summary counts the whole sync")
+        XCTAssertEqual(summary.filesInVault, total)
+        XCTAssertEqual(summary.errors, [])
+        XCTAssertEqual(sandbox.vaultFiles.count, total)
+    }
+
     func testTornJournalLineIsIgnoredAndTheChangeIsRepublished() async throws {
         try sandbox.write("alpha", machine: 0, to: "alpha.txt")
         try await sandbox.sync(0)
