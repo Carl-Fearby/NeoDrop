@@ -405,6 +405,15 @@ public struct VaultStore: Sendable {
 
     /// Append to this machine's journal. One `write` per entry, each ending in a newline, so a
     /// crash can only ever leave a torn *last* line — which `loadEntries` tolerates.
+    ///
+    /// A tear left by an earlier crash is trimmed away first, back to the last complete line. That
+    /// is not tidiness: appending after a tear would join the two into one unreadable line, and an
+    /// unreadable *last* line is ignored, so the entry written after the tear would be dropped
+    /// silently. Its bytes are already on the share (they are copied before the journal records
+    /// them) while no machine is ever told about them, which is how a change ends up on one Mac and
+    /// nowhere else. Trimming instead means the pass that crashed never advanced its cursor, so the
+    /// ordinary path publishes the change again on the next sync — a repeated change, never a
+    /// lost one. The undecodable line itself described nothing anybody could read.
     public func append(_ entries: [JournalEntry], machineID: String) throws {
         guard !entries.isEmpty else { return }
         try ensureDirectories()
@@ -422,11 +431,43 @@ public struct VaultStore: Sendable {
             try? AtomicFile.flush(fileAt: url)
             return
         }
-        let handle = try FileHandle(forWritingTo: url)
+        // Opened for *updating*, not merely for writing: telling a tear from a whole line means
+        // reading the last byte, and a write-only descriptor cannot be read at all. Appending does
+        // not need to read normally; this one case does.
+        let handle = try FileHandle(forUpdating: url)
         defer { try? handle.close() }
+        try Self.trimTornTail(of: handle)
         try handle.seekToEnd()
         try handle.write(contentsOf: payload)
         try handle.synchronize()
+    }
+
+    /// Drop a final line that has no newline, if there is one. The file is left ending on a
+    /// complete line, so the next append cannot run into it.
+    ///
+    /// Reading backwards a chunk at a time rather than the whole journal: a journal grows for ever,
+    /// and this runs on every append.
+    static func trimTornTail(of handle: FileHandle) throws {
+        let size = try handle.seekToEnd()
+        guard size > 0 else { return }
+        try handle.seek(toOffset: size - 1)
+        guard let last = try handle.read(upToCount: 1), last.first != 0x0a else { return }
+
+        let chunk: UInt64 = 64 * 1024
+        var end = size - 1
+        while end > 0 {
+            let start = end > chunk ? end - chunk : 0
+            try handle.seek(toOffset: start)
+            guard let window = try handle.read(upToCount: Int(end - start)), !window.isEmpty else { break }
+            if let newline = window.lastIndex(of: 0x0a) {
+                try handle.truncate(atOffset: start + UInt64(newline) + 1)
+                return
+            }
+            end = start
+        }
+        // No complete line anywhere in the file: nothing in it is readable, and every entry it
+        // never got to describe is re-published by the pass that wrote it.
+        try handle.truncate(atOffset: 0)
     }
 
     /// Everything every machine has published, plus the lines that could not be read.

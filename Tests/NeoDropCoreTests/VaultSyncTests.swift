@@ -885,6 +885,57 @@ final class VaultSyncTests: XCTestCase {
         XCTAssertEqual(try sandbox.vaultRead("alpha.txt"), "alpha")
     }
 
+    /// The tear is what the previous test tolerates; this is what must not happen *after* it.
+    ///
+    /// Appending after a tear joins the two into one unreadable line, and an unreadable last line
+    /// is ignored — so the entry written after the tear is dropped while its bytes are already on
+    /// the share, and the other Mac stays on the old version for ever. Trimming the tear first is
+    /// what keeps the failure mode at "a repeated change".
+    func testAnEntryWrittenAfterATornLineIsStillPublishedAndApplied() async throws {
+        try sandbox.write("alpha", machine: 0, to: "alpha.txt")
+        try await sandbox.sync(0)
+        try sandbox.appendToJournal(machine: 0, raw: "{\"seq\":99,\"machine\":\"x\"")
+
+        try sandbox.write("beta", machine: 0, to: "beta.txt")
+        let after = try await sandbox.sync(0)
+
+        XCTAssertEqual(after.errors, [])
+        XCTAssertEqual(after.uploaded, 1)
+        XCTAssertEqual(sandbox.journalLines(machine: 0).count, 2, "the tear is trimmed, not joined to")
+        let loaded = VaultStore(root: sandbox.vault).loadEntries()
+        XCTAssertEqual(loaded.errors, [], "a trimmed tear is not corruption")
+        XCTAssertEqual(Set(loaded.entries.map(\.path)), ["alpha.txt", "beta.txt"])
+
+        // The point of all of it: the other machine is told.
+        try await sandbox.sync(1)
+        XCTAssertEqual(try sandbox.read(machine: 1, "beta.txt"), "beta")
+    }
+
+    /// A journal that is nothing but a torn line — a crash before even the first entry landed.
+    func testAppendingToAJournalThatIsOnlyATornLineKeepsTheNewEntry() throws {
+        let store = VaultStore(root: sandbox.vault)
+        try store.ensureDirectories()
+        let url = store.journalURL(machine: "machine-1")
+        try Data("{\"seq\":1,\"mach".utf8).write(to: url)
+
+        let entry = JournalEntry(
+            seq: 1, machine: "machine-1", machineName: "A",
+            path: "a.txt", kind: .create, size: 3, sha256: "abc"
+        )
+        try store.append([entry], machineID: "machine-1")
+
+        let loaded = store.loadEntries()
+        XCTAssertEqual(loaded.errors, [])
+        XCTAssertEqual(loaded.entries.count, 1)
+        // Compared field by field: a journal timestamp is written with milliseconds, so the entry
+        // that comes back is the one that went in only to that precision.
+        XCTAssertEqual(loaded.entries.first?.path, entry.path)
+        XCTAssertEqual(loaded.entries.first?.sha256, entry.sha256)
+        XCTAssertEqual(loaded.entries.first?.seq, entry.seq)
+        XCTAssertEqual(loaded.entries.first?.machine, entry.machine)
+        XCTAssertEqual(loaded.entries.first?.kind, entry.kind)
+    }
+
     /// The sequence a pass writes into the journal has to be the one the journal would have given
     /// it. It is derived from the entries the pass already read rather than from a second full read
     /// of every journal — the most expensive thing a pass does, done twice, growing with the

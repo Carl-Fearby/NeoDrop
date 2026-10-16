@@ -91,7 +91,15 @@ behaviour, change the test only with a written reason.
 12. **Bytes land on the share before the journal records them**, so a crash in between re-publishes
     a change rather than losing one. A torn final journal line is ignored; a torn middle one is
     reported as corruption (`testTornJournalLineIsIgnoredAndTheChangeIsRepublished`,
-    `testBytesOnTheShareWithoutAJournalLineAreAnnouncedByTheNextSync`).
+    `testBytesOnTheShareWithoutAJournalLineAreAnnouncedByTheNextSync`). The *next* append **trims**
+    such a tail first, back to the last complete line — appending straight after a tear joins the two
+    into one unreadable line, and an unreadable *last* line is ignored, so the entry written after
+    the tear would be dropped while its bytes were already on the share: the change exists on one Mac
+    and no other machine is ever told, and the next pass elsewhere puts the old version back. Trimming
+    keeps the failure mode at "a repeated change" (`testAnEntryWrittenAfterATornLineIsStillPublishedAndApplied`,
+    `testAppendingToAJournalThatIsOnlyATornLineKeepsTheNewEntry`). That one check opens the journal for
+    *updating* rather than writing, because a write-only descriptor cannot be read at all — which is
+    how the first version of it turned every later append into "Could not write the journal".
 13. **The bulk-deletion guard covers remote deletions too.** A journal that would empty a folder is
     held back on the receiving machine, not applied (`testRemoteBulkDeletionIsHeldBackOnTheReceivingMachine`).
 14. **A restore into a two-way folder is an undelete, and it is recorded as one.** A file put back

@@ -173,7 +173,7 @@ all enforced in code and covered by tests:
 | A two-way folder's local side and its vault must be separate folders, and both must already exist | A vault nested in the folder it syncs copies files into themselves; creating either one would sync onto the boot volume when a disk is unplugged |
 | Nothing is ever destroyed to resolve a conflict | The losing version is kept beside the original and in `.neodrop/versions/` — the one part of a sync tool users never forgive getting wrong |
 | A change is on the share before the journal records it | A crash between the two leaves a change that is simply re-published, never a file nobody knows about |
-| A torn last journal line is ignored, a torn middle one is reported | A pulled cable during an append is normal; damage in the middle of a file is corruption and must be said out loud |
+| A torn last journal line is ignored, a torn middle one is reported, and the next append trims the tear away | A pulled cable during an append is normal; damage in the middle of a file is corruption and must be said out loud. Writing straight after a tear would join the two into one line nobody can read, and the entry would be lost while its bytes sat on the share — so the tear is trimmed and the change is simply published again |
 | Deletions arriving from another machine face the same bulk guard as a mirror's | A corrupt or hand-edited journal must not be able to empty a folder in one sync |
 | `.neodrop/` and `.neodrop-trash/` are never published or applied | A sync tool that syncs its own bookkeeping feeds on its own output |
 
