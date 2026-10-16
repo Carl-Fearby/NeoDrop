@@ -36,7 +36,8 @@ habit:
   the source no longer has the file. A wiped NAS is rebuilt from the survivors.
 * **A delete is a 30-day undo.** Delete a file in a protected folder and it does not vanish: each
   share keeps the bytes under `.neodrop-trash/`, and the menu's **Deleted Files…** window lists
-  what is recoverable and puts it back.
+  what is recoverable and puts it back. **An edit is a 30-day undo too:** the version a copy
+  replaces is kept the same way, from the same window.
 * **No credentials, ever.** NeoDrop never sees a NAS password. It mounts shares by asking Finder,
   which uses the credentials already in your Keychain.
 * **Nothing leaves the machine.** No account, no telemetry, no server.
@@ -64,11 +65,24 @@ When a file disappears from every source folder, NeoDrop does not delete it. On 
 is *renamed* into `.neodrop-trash/` at the same relative path — a rename, so nothing is re-uploaded —
 and a record says where it came from, its size and its checksum. The bytes stay for **30 days**.
 
+The same window holds the version a copy **replaced**. A mirror has no version control, so an edit
+would otherwise be the end of the previous contents. Instead, before a sync copies over a file it
+wrote itself, it moves the copy that is about to be lost into the same trash directory and records it
+the same way — one rename inside the share, nothing re-uploaded. One version per file is kept: the
+newest one, and the list says which entries were *deleted* and which were *replaced*.
+
 **Deleted Files…** in the menu opens the recovery window: everything currently recoverable, which
 destinations still hold a copy, how long each entry has left, and a Restore button. Restoring writes
-the file back to its original folder (verified against the record's checksum first), gives the
-retained copies back, and re-mirrors it to every share immediately. Nothing is ever overwritten: if a
-file already sits at the destination, the restore refuses unless it is byte-identical.
+the version back to its original folder (verified against the record's checksum first), gives the
+retained copies back, and re-mirrors it to every share immediately.
+
+Restoring a *deleted* file never overwrites: if a file already sits at the path, the restore refuses
+unless it is byte-identical. Restoring a *replaced* version is the opposite instruction — put the
+earlier version back — so it does write over the newer file, but only when that newer version is
+verifiably on a mounted destination already, where it can be brought back. If it is not (an edit no
+sync has published yet, or a share that is unmounted), the restore refuses and says why rather than
+destroying the only copy of your newest work. **Verify & Repair** also retains the bytes it repairs
+over, including a share-edited copy, so repair does not make those bytes disappear without recovery.
 
 Recovery is how deletions are *meant* to work, not a side channel: files that come back to the source
 are dropped from the list, and entries are purged — bytes and record together — only after their
@@ -135,12 +149,14 @@ all enforced in code and covered by tests:
 |---|---|
 | Only files NeoDrop wrote are ever deleted (tracked in a per-replica manifest) | A replica can share a volume with other data; foreign files are never touched |
 | A file NeoDrop did not write is never replaced, only refused and reported | A name collision in a shared folder is no reason to lose somebody's file: the copy on the share may exist nowhere else. A file that is already there with the source's exact bytes is *adopted* instead, which is what makes a clean install cheap |
+| A copy on a share that is not the version NeoDrop recorded is left alone by sync | An edit made straight on the share, a partial upload, or a folder where a file belongs exists nowhere else either — it is named in the run's report and the next sync takes the path once it is moved aside. **Verify & Repair** is explicit permission to replace a bad copy, but it retains the bytes first |
 | A replica root must already exist — it is never created | An unmounted share would otherwise make `/Volumes/NAS2/NeoDrop` resolve to the boot disk, and you'd "mirror" onto your own SSD |
 | Deletions are refused when a source could not be read | A renamed or unplugged source folder must never be interpreted as "everything was deleted" |
 | More than 25% of a replica (or 25 files) deleted in one run is refused unless explicitly allowed | Stops the signature mirroring disaster: one bad sync empties the NAS |
 | Every copy goes through a temp file plus a rename in the destination folder | A dropped SMB connection leaves the old file, not a truncated new one |
-| A deletion is recorded before it happens, and its bytes are kept for 30 days | "Undo" is the difference between a mirror and a shredder: a mistaken delete stays recoverable on every share |
-| A restore never overwrites, and never deletes ahead of its window | The copy in the trash is often the only copy left of a file, so nothing may be destroyed early or clobbered |
+| A deletion, and the version a copy is about to replace, are recorded before the bytes move, and kept for 30 days | "Undo" is the difference between a mirror and a shredder: a mistaken delete *and* an overwritten edit stay recoverable on every share. Records are written first because a record without bytes self-heals while bytes with no record are unreachable forever |
+| Restoring a replaced version overwrites the newer file only when it is verifiably on a mounted destination | Putting an earlier version back is the one restore that must write over something, and doing it blind would destroy the only copy of the newer one |
+| A restore never overwrites a deleted file, and never deletes ahead of its window | The copy in the trash is often the only copy left of a file the user deleted deliberately, so nothing may be destroyed early or clobbered |
 | Paths read out of a record are checked against the directory they belong in | Records are editable JSON; a corrupt one must not be able to point a delete or a restore anywhere else |
 | A two-way folder's local side and its vault must be separate folders, and both must already exist | A vault nested in the folder it syncs copies files into themselves; creating either one would sync onto the boot volume when a disk is unplugged |
 | Nothing is ever destroyed to resolve a conflict | The losing version is kept beside the original and in `.neodrop/versions/` — the one part of a sync tool users never forgive getting wrong |
@@ -378,7 +394,7 @@ so the state is visible without opening anything.
 | Clock | Here, but not everywhere yet — new or edited since the last sync, or a destination was away when it ran (**Sync Now** is the fix) | Every file you edit, until the next sync |
 | Spinning arrows | NeoDrop is reading or writing this file right now | Only while a sync is running and the app has republished the index mid-run |
 | Orange triangle | A destination copy is missing or no longer matches the record — run **Verify & Repair** | A copy that was deleted or replaced by hand |
-| Trash | Bytes NeoDrop is deliberately holding after a deletion, recoverable from **Deleted Files…** | On a destination's `.neodrop-trash/` folder, not per retained file |
+| Trash | Bytes NeoDrop is deliberately holding — a deletion, or a version a copy replaced — recoverable from **Deleted Files…** | On a destination's `.neodrop-trash/` folder, not per retained file |
 | Question mark | On a destination but not written by NeoDrop: somebody put it there by hand, and NeoDrop will not delete or overwrite it | The only badge outside a protected folder — a sync found a file that is not NeoDrop's where the mirror wanted one, and left it alone |
 | Dash | Nothing to do with NeoDrop, inside a protected folder but matching an ignore pattern | **Not yet** — the shape is defined, but nothing publishes it |
 
@@ -429,6 +445,7 @@ Sources/NeoDropCore/     engine: scanning, hashing, mirroring, verification, rep
   Vault.swift            vault + machine identity, the append-only journal, path normalisation,
                          retained versions, the local cursor
   VaultSync.swift        the two-way reconciler: publish, apply, seed, adopt, conflicts
+  ActivityFeed.swift     what the Activity window shows: tabs, search, titles, the footer
   FileStatus.swift       "is this file safe?": every copy, what was recorded for it, its history
   FinderStatusBuilder.swift  the badge index the Finder extension reads, from records NeoDrop
                          already has — no hashing and no directory walk
@@ -441,13 +458,16 @@ Sources/NeoDropCore/     engine: scanning, hashing, mirroring, verification, rep
   ConfigValidator.swift  "this configuration does not actually protect anything" checks
   FolderWatcher.swift    FSEvents with debounce
 Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, the two web views
+  SyncActivityView.swift  the Activity window, laid out over ActivityFeed
   SetupWizard.swift      the first-run wizard: the main folder, then the mode, then the destination
   VaultsTab.swift        the Two-Way settings tab
   VaultStatus.swift      per-folder display state for the menu and Settings
 Sources/NeoDropShared/   the badge format, shared by the app and the Finder extension
 Sources/NeoDropFinder/   the Finder Sync extension: the badges next to a file's date
-Tests/NeoDropCoreTests/  193 tests: one per safety rule above, plus the vault, web-UI parsing, path
-                         and badge cases — the container one asserts both sides of the signing rule
+Tests/NeoDropCoreTests/  238 tests: one per safety rule above, plus the vault (including the paged
+                         catch-up and its cursor), the Activity window's filtering and wording,
+                         web-UI parsing, path and badge cases — the container one asserts both
+                         sides of the signing rule
 Resources/AppIcon.png    master app-icon artwork, masked by scripts/make-icon.swift
 Resources/MenuBarIcon*.png  menu bar template icon at 1x/2x/3x, plus the .svg master
 Resources/dmg-background.png  installer window wallpaper, as supplied (the master)
@@ -561,19 +581,24 @@ Deliberate omissions and known gaps, roughly in order of value:
   container itself is a third case: nothing removes it — not a script, not the app, not root, not
   Finder — so the uninstaller leaves it behind and says so.
 
-* **File history / versioning, in mirror mode.** A deletion is recoverable for 30 days everywhere,
-  and a two-way folder keeps the previous contents of anything it overwrites in `.neodrop/versions/`
-  for the same window — File Status shows that history per path. A *mirror* still has no versioning
-  at all: the previous contents are gone the moment the new copy lands. A “Versions” browser over
-  those retained blobs is the natural next step.
-* **Resolving a file NeoDrop will not replace, from inside the app.** A file somebody else put where
-  the mirror wants one is left alone, badged with a question mark and named in the run's report, and
-  the next step is on the share itself: move or delete it and sync again. “Take the share's copy” or
-  “replace it deliberately” are not built, so the decision is a Finder one for now.
-* **Making two-way folders work with a Mac that is asleep or offline for weeks.** Nothing is
-  corrupted — the journal is append-only and the cursor is per machine — but a machine that was away
-  for a long time does all its catching up in one sync, and a very large vault then means a long
-  first sync with no resumability beyond retrying.
+* **Full file history, in mirror mode.** The **Deleted Files & Versions** window now searches and
+  filters retained copies, shows their checksum and restore destination, and confirms before putting
+  a previous version back over the newer one. A deletion *and* the version a copy replaces remain
+  recoverable for 30 days everywhere; a two-way folder keeps the previous contents of anything it
+  overwrites in `.neodrop/versions/` for the same window. What mirror mode does not keep is a chain:
+  there is one previous version per path, and a later edit replaces the earlier retained version.
+* **Taking the share's copy as the source, from inside the app.** The **Deleted Files & Versions**
+  window now lists unresolved conflicts per replica, shows the share-file digest and matching source
+  path, and offers an explicit **Replace with source…** action. It refuses directories, offline shares,
+  a conflict whose bytes changed since it was listed, and anything without a matching source file.
+  Before writing, the share's bytes are moved into the 30-day recovery store as a replaced version;
+  then the normal sync brings the source version to the other replicas. Choosing “keep the share copy
+  instead” is still a Finder operation — NeoDrop never imports destination data into a protected source.
+* **Making two-way folders work with a Mac that is asleep or offline for weeks.** Catch-up is now
+  resumable in 500-path pages: the local cursor saves a stable path checkpoint, and the next scheduled
+  sync continues where the last one ended. A failure leaves the checkpoint at the last complete page,
+  so a retry safely repeats work rather than skipping it. This bounds per-pass file reconciliation;
+  scanning and reading the journal still cover the full local tree and vault metadata.
 * **A share that disagrees with its own journal.** A file deleted or truncated *on the share* is put
   back from retained content, and the bytes on the share are checked by size on every sync; a
   same-size corruption needs **Verify & Repair** (which re-hashes). An index of what the share holds

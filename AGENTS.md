@@ -54,11 +54,25 @@ behaviour, change the test only with a written reason.
    (`testAtomicCopyLeavesNoTempFilesBehind`).
 6. **Verification re-hashes.** Never replace it with a size or mtime comparison
    (`testVerifyDetectsSilentCorruption`).
-7. **A deletion is recorded before it happens, and the bytes outlive it by 30 days.** The file is
-   moved into `.neodrop-trash/` on each replica with a record describing where it came from, and a
-   restore never overwrites anything (`testDeletedFileIsRetainedInsteadOfDestroyed`,
-   `testRestoreRefusesToOverwriteADifferentFile`). Records and bytes are removed together, and only
-   once the window has closed (`testExpiredRecordIsPurgedWithItsBytes`).
+7. **A deletion — and the version a copy is about to replace — is recorded before the bytes move,
+   and the bytes outlive them by 30 days.** A deleted file is moved into `.neodrop-trash/` on each
+   replica with a record describing where it came from; a version the sync is about to write over is
+   kept the same way, tagged `reason: .replaced`, and refused rather than overwritten when the copy
+   on the share is not the version NeoDrop recorded. Verify & Repair retains its displaced bytes as
+   well, including a hand edit made on the share
+   (`testDeletedFileIsRetainedInsteadOfDestroyed`, `testRestoreRefusesToOverwriteADifferentFile`,
+   `testAnEditedFileKeepsItsPreviousVersionOnEveryDestination`,
+   `testASameSizeEditOnTheShareIsNotReplaced`,
+   `testVerifyRepairRetainsShareEditedBytesBeforeRepair`). Records and bytes are removed together,
+   and only once the window has closed (`testExpiredRecordIsPurgedWithItsBytes`).
+7b. **A restore overwrites exactly one thing, and only when what it overwrites is provably
+   elsewhere.** Restoring a replaced version writes over the newer file, which is allowed only when
+   that version is verifiably on a mounted replica; restoring a deleted file still refuses to
+   overwrite anything (`testRestoringAPreviousVersionPutsTheOlderBytesBack`,
+   `testRestoringIsRefusedWhenTheNewerVersionHasNotReachedAShare`,
+   `testRestoringIsRefusedWhileEveryShareIsUnmounted`). Which of the two a record is comes from
+   `DeleteRecord.reason`, decoded with a default so records written before it still load
+   (`testARecordFromAnOlderBuildStillLoads`).
 8. **A record is data, not a command.** Every path read out of a record is checked to be inside the
    directory it belongs in before anything is deleted, written or restored
    (`testRecordThatEscapesTheTrashDirectoryIsNeverActedOn`).
@@ -97,16 +111,24 @@ behaviour, change the test only with a written reason.
     (`testDecodesAConfigWrittenBeforeVaultsExisted`). `Manifest` does the same for the same reason:
     `ManifestStore.load` turns a decode failure into an empty manifest, which on a share means
     uploading every file again (`testAManifestFromAnOlderBuildKeepsItsEntries`).
-17. **A file NeoDrop did not write is never replaced.** Something else at a path the mirror wants is
-    left exactly as it is — byte for byte — reported in the run's summary, and recorded in
-    `Manifest.foreignPaths` so the Finder extension can badge it as `foreign`
+17. **A file NeoDrop did not write is never replaced automatically.** Something else at a path the
+    mirror wants is left exactly as it is — byte for byte — reported in the run's summary, and
+    recorded in `Manifest.foreignPaths` so the Finder extension can badge it as `foreign`
     (`testAFileNeoDropDidNotWriteIsNeverReplaced`, `testAFileNeoDropDidNotWriteIsBadgedAsForeign`).
-    This is the one copy that could destroy a file existing nowhere else, so the mirror gives up the
-    path instead, and the next sync takes it once the file is out of the way. The same check is where
-    a *lost manifest* is noticed: a file already carrying the source's exact bytes is **adopted** into
-    the manifest rather than uploaded again — same size first, and only then a hash
-    (`testAFileAlreadyOnTheShareWithTheSourcesBytesIsAdoptedInsteadOfUploaded`). That is what makes the
-    clean-install instructions true, and what stops a fresh install from re-uploading a whole library.
+    The same check is where a *lost manifest* is noticed: a file already carrying the source's exact
+    bytes is **adopted** into the manifest rather than uploaded again — same size first, and only
+    then a hash (`testAFileAlreadyOnTheShareWithTheSourcesBytesIsAdoptedInsteadOfUploaded`). That is
+    what makes the clean-install instructions true, and what stops a fresh install from re-uploading
+    a whole library.
+17b. **The user can explicitly replace a listed foreign regular file, but only against the bytes
+    they reviewed.** The UI sends that file's SHA-256 and replica identity; the engine rejects a stale
+    digest, traversal path, directory, missing source or unavailable replica. The old share bytes
+    are verified, recorded as `reason: .replaced`, and moved into `.neodrop-trash/` before the source
+    copy lands; success updates the manifest and clears the foreign badge. This is the only path that
+    deliberately replaces a foreign file (`testExplicitReplaceRetainsShareBytesAndCopiesSourceVersion`,
+    `testChangedShareBytesAfterListingAreRefusedAndNotTouched`,
+    `testDirectoryConflictIsVisibleButNeverOfferedForReplace`,
+    `testAnOfflineConflictIsListedButDisabled`, `testAPathTraversalCannotResolveAForeignConflict`).
     `scripts/e2e.sh` stages the real thing: a file put on NAS1 by hand at a path the source then gains,
     checked byte for byte after the app's own sync.
 
@@ -143,6 +165,17 @@ Things that are easy to get wrong and are therefore deliberate:
   by link id) marks a file the user put back through “Deleted Files…”, because the reconcile cannot
   tell that from a Mac that was asleep through the deletion — and those two must resolve differently.
   Markers are dropped once published, and pruned when the path is no longer a tombstone.
+* **A pass over the tree is bounded, and the cursor says where it stopped.** A two-way folder can
+  hold a hundred thousand files, so `reconcile` walks at most `catchUpBatchSize` paths per call and
+  `AppModel` keeps calling it while `catchUpPending` is true (bounded by `maxCatchUpPasses`). Three
+  properties keep that from becoming loss, and each has a test behind it: the walk resumes where it
+  stopped and only clears the cursor once it has covered the tree; anything that changed since the
+  last pass — locally, or in the vault on another machine — is named in `catchUpDirtyPaths` and
+  re-checked *even though the page has moved past it*, because a cursor that only walks forward
+  never revisits what it skipped; and a page that makes room for those paths drops its **last**
+  keys, so the cursor stops short of them rather than stepping over them. `catchUpSeenAt` is stored
+  as milliseconds because the cursor file keeps whole seconds and the journal keeps milliseconds —
+  comparing the two as written calls an entry published in the same second "new" for ever.
 * **No `pruneEmptyDirectories` on the local side.** On a replica an empty directory is leftovers; a
   person's working copy is not NeoDrop's to tidy.
 
@@ -223,6 +256,26 @@ answers 404 until a handler is supplied.
 One subtlety in the query string: `HTTPRequest.query` does **not** decode `+` as a space, unlike a
 form submission. A file name may contain a literal `+`, and form-style decoding would silently
 answer about a different file. Spaces arrive percent-encoded, which is what the app sends.
+
+## The Activity window (`SyncActivityView.swift`, `ActivityFeed.swift`)
+
+The window is decoration around `ActivityFeed`, which is in `NeoDropCore` and holds all of the
+judgement: which lines a tab shows, what a row is titled, how a size or a count is worded, what the
+footer says. A view that decides what the log *means* is a view whose mistakes are only visible to
+whoever happens to be looking at it, so `SyncActivityView` draws what it is handed and nothing else.
+
+* **The tabs read `LogScope`, not words.** They used to search the message for “vault” and
+  “two-way”, which failed in both directions: the line a two-way sync writes — “Shared: 2 sent,
+  1 received” — contains neither word, so the tab that exists to show that work showed none of it,
+  while a replica whose folder was called `Vault-backup` landed in it. Whoever writes a log line
+  says what it is about (`NeoDropLog.write(_:level:scope:)`); the *file* log never records the
+  scope, so `scripts/e2e.sh`'s greps keep working.
+* **A row says the path once.** `ActivityFeed.split` turns “Documents/a.txt: copied” into the title
+  “Documents/a.txt” and the detail “OK · 14:02 · copied”. A line that does not begin with a path is
+  its own title, whole: cutting “Shared: 2 sent, 1 received” at the colon would throw away the half
+  that carries the meaning.
+* **A warning is not drawn like a success**: `.problem` for warnings and errors, and the finished
+  bar only for `.success`.
 
 ## The icon
 
