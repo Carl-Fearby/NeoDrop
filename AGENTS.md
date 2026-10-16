@@ -15,7 +15,7 @@ server and no cloud component.
 
 ```bash
 swift build                                        # compile everything
-swift test                                         # 193 engine tests, all green
+swift test                                         # 248 engine tests, all green
 swift run NeoDrop                                  # run the app (menu bar icon)
 swift build -c release --show-bin-path             # locate the release binary
 scripts/package.sh [--arch universal] [--no-dmg]   # .app + DMG, ad-hoc signed by default
@@ -176,6 +176,35 @@ Things that are easy to get wrong and are therefore deliberate:
   keys, so the cursor stops short of them rather than stepping over them. `catchUpSeenAt` is stored
   as milliseconds because the cursor file keeps whole seconds and the journal keeps milliseconds —
   comparing the two as written calls an entry published in the same second "new" for ever.
+* **A tree with nothing to do settles in one pass, and the proof is the journals' size.** The page
+  bounds *work*; a tree that already agrees with the vault has none, and walking it in `N/500` passes
+  was pure cost — measured on a 5,000-path vault, ten passes and sixteen seconds for a sync that
+  changed nothing, every fifteen minutes, for ever. `reconcile` therefore settles such a tree in a
+  single pass, and asks each thing that could make it interesting cheaply and exactly: whether any
+  journal has **grown** (`catchUpJournalBytes` — byte sizes, not timestamps, because two entries can
+  share a millisecond and a change missed here would be missed for ever), whether this machine's
+  folder still holds exactly what the vault says it holds, and whether anyone dropped a file into the
+  share by hand or the last pass left something to revisit. The record is written from the sizes read
+  at the *start* of a pass, so a machine that appends while it runs leaves the record behind reality
+  and the next pass walks — the safe direction, and the cost of one extra walk after a sync that
+  published something. Settling is not looking away: retention still runs (its window closes on the
+  clock, not on changes), an unclaimed file is still adopted — which is work, so that pass is not
+  settled — and a share file that is missing or not the size the journal records is still put back
+  from this machine's copy. `SettledSyncTests` holds each of those, and
+  `testASyncWithNothingToDoSettlesInOnePass` holds the cost.
+* **A pass reads the journal once, and asks it for nothing else.** `VaultStore.nextSequence` decodes
+  *every* journal to answer a question about one of them, and `reconcile` was calling it just after
+  reading them all itself — a second full read of the most expensive thing a pass does. Measured on a
+  1,200-path vault whose journal held 2,400 entries: 172 ms of a 578 ms settled pass, every fifteen
+  minutes, growing with the vault's *history* rather than its size. The sequence is now derived from
+  the entries already in hand (`VaultSync.nextSequence(in:machineID:)`), which brought the same
+  settled pass to 382 ms (`testTheSequenceComesFromTheEntriesThePassAlreadyRead`). What is still
+  unbounded is the read itself: every pass decodes every line of a journal that only grows, so a vault
+  in use for years pays more each sync for the same unchanged tree. Bounding it means keeping the
+  folded state per machine and reading only the bytes after the last line it folded — the same
+  byte-size proof the settle already rests on — and that is **not built**; it is the next real win
+  here, and a cached state that is ever wrong means skipped changes, so it needs the same care the
+  settle got.
 * **No `pruneEmptyDirectories` on the local side.** On a replica an empty directory is leftovers; a
   person's working copy is not NeoDrop's to tidy.
 

@@ -328,8 +328,23 @@ public struct VaultStore: Sendable {
     /// A stat-per-entry walk with no hashing: most paths are already known, and the caller hashes
     /// only what it decides to adopt.
     public func untrackedFiles(known livePaths: Set<String>, excludes: ExcludeMatcher) -> [String] {
+        liveTree(excludes: excludes)
+            .filter { !livePaths.contains($0.key) }
+            .map(\.path)
+    }
+
+    /// The share's live tree as it is now: every regular file, with the path it is spelled with on
+    /// disk and its size.
+    ///
+    /// One walk answers every question a sync still has about the share — "is what the journal says
+    /// is there still there, at the size we recorded?" and "did a person drop something in?" —
+    /// which is why this exists at all rather than a check per path: on a share holding thousands of
+    /// files, per-path checks are thousands of round trips, and this is one enumeration. Order is
+    /// the filesystem's, so callers that care about order (adoption, and the journal sequence it
+    /// writes) see the same order they always did.
+    public func liveTree(excludes: ExcludeMatcher) -> [(key: String, path: String, size: Int64)] {
         let fm = FileManager.default
-        let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
         guard let enumerator = fm.enumerator(
             at: root,
             includingPropertiesForKeys: keys,
@@ -337,7 +352,7 @@ public struct VaultStore: Sendable {
             errorHandler: { _, _ in true }
         ) else { return [] }
 
-        var orphans: [String] = []
+        var files: [(key: String, path: String, size: Int64)] = []
         for case let url as URL in enumerator {
             guard let values = try? url.resourceValues(forKeys: Set(keys)) else { continue }
             let name = url.lastPathComponent
@@ -356,10 +371,25 @@ public struct VaultStore: Sendable {
             guard values.isRegularFile == true else { continue }
             let relative = Scanner.relativePath(of: url, under: root)
             if excludes.matches(fileName: name, relativePath: relative) { continue }
-            if livePaths.contains(VaultPath.key(relative)) { continue }
-            orphans.append(relative)
+            files.append((VaultPath.key(relative), relative, Int64(values.fileSize ?? 0)))
         }
-        return orphans
+        return files
+    }
+
+    /// The byte size of every journal file, by name.
+    ///
+    /// A journal is append-only, so "has any of them grown?" is an exact answer to "has another
+    /// machine published anything since I looked?" — exact where a timestamp is not (two entries can
+    /// share a millisecond) and cheaper than reading them, since it is one stat per machine.
+    public func journalSizes() -> [String: Int64] {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: journalsURL.path) else { return [:] }
+        var sizes: [String: Int64] = [:]
+        for name in names where name.hasSuffix(".jsonl") {
+            let attributes = try? fm.attributesOfItem(atPath: journalsURL.appendingPathComponent(name).path)
+            sizes[name] = ((attributes?[.size] as? NSNumber)?.int64Value) ?? 0
+        }
+        return sizes
     }
 
     /// True when the directory looks like a vault (or is an empty folder we can turn into one).
@@ -374,7 +404,7 @@ public struct VaultStore: Sendable {
     // MARK: Journals
 
     /// Append to this machine's journal. One `write` per entry, each ending in a newline, so a
-    /// crash can only ever leave a torn *last* line — which `loadAllEntries` tolerates.
+    /// crash can only ever leave a torn *last* line — which `loadEntries` tolerates.
     public func append(_ entries: [JournalEntry], machineID: String) throws {
         guard !entries.isEmpty else { return }
         try ensureDirectories()
@@ -456,6 +486,9 @@ public struct VaultStore: Sendable {
         return state
     }
 
+    /// The next per-machine sequence number. A pass should ask `VaultSync.nextSequence(in:machineID:)`
+    /// instead when it already holds the entries: this reads and decodes every journal to answer a
+    /// question about one of them.
     public func nextSequence(machineID: String) -> Int {
         let entries = loadEntries().entries.filter { $0.machine == machineID }
         return (entries.map(\.seq).max() ?? 0) + 1
@@ -539,6 +572,18 @@ public struct VaultCursor: Codable, Sendable {
     /// It is a heuristic, and it only decides what is re-checked *early*: a change the page walk
     /// has left behind is picked up by the next walk over the tree regardless of what this says.
     public var catchUpSeenAt: Int64?
+    /// The journal files' byte sizes as this machine last saw them *before* a pass it finished.
+    ///
+    /// This is what makes a sync that has nothing to do provable rather than a guess: journals only
+    /// grow, so equal sizes mean nothing has been published to the vault since, and a tree this
+    /// machine agrees with cannot have changed behind its back. Nil means no completed pass to
+    /// compare against, which is a fresh install or a cleared state directory — it always walks.
+    ///
+    /// Recorded from the sizes read at the *start* of a pass, on purpose: if another machine appends
+    /// while that pass runs, the record stays behind reality and the next pass walks, which is the
+    /// safe direction. Our own appends have the same effect, and cost one extra walk after a sync
+    /// that published something.
+    public var catchUpJournalBytes: [String: Int64]?
 
     public init(
         vaultID: UUID,
@@ -547,7 +592,8 @@ public struct VaultCursor: Codable, Sendable {
         lastSync: Date? = nil,
         catchUpAfter: String? = nil,
         catchUpDirtyPaths: [String]? = nil,
-        catchUpSeenAt: Int64? = nil
+        catchUpSeenAt: Int64? = nil,
+        catchUpJournalBytes: [String: Int64]? = nil
     ) {
         self.vaultID = vaultID
         self.machineID = machineID
@@ -556,6 +602,7 @@ public struct VaultCursor: Codable, Sendable {
         self.catchUpAfter = catchUpAfter
         self.catchUpDirtyPaths = catchUpDirtyPaths
         self.catchUpSeenAt = catchUpSeenAt
+        self.catchUpJournalBytes = catchUpJournalBytes
     }
 }
 

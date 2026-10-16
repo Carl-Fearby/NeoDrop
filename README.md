@@ -129,6 +129,18 @@ sync reads the journals, pulls every file down, and starts publishing that machi
 If the folder it is given already holds files, those are published too — and any path that differs
 from the vault becomes a conflicted copy rather than a silent overwrite.
 
+**A sync with nothing to do costs next to nothing.** Walking the tree in pages bounds *work*, but a
+folder that already agrees with the vault has none, and re-walking it every fifteen minutes was the
+expensive part. When this Mac's folder, the vault's tree and the journals all still line up, the sync
+settles in a single pass — and it knows they line up *exactly* rather than by guessing, because the
+journals are append-only and their byte sizes prove that no other Mac has published since the last
+pass. Settling is not looking away: retention still runs (its window closes on the clock), a file
+dropped into the vault by hand is still noticed and adopted, and a share file that is missing or the
+wrong size is still put back from this Mac's copy. Any of those, or a change published elsewhere or
+made here, brings the full walk straight back. That pass reads the shared journal once: the entry
+number it writes under comes from the copy it has just read, not from a second read of everything the
+vault has ever recorded.
+
 **Nothing is decided by a clock alone.** Ordering is by timestamp with millisecond precision, and
 when two entries share an instant the one written *on top of* the other's content wins — causality
 rather than a guess, so machines with skewed clocks still agree. A conflict never loses data: the
@@ -174,7 +186,7 @@ reached for one does not stop the other.
 
 ```bash
 swift build                 # library + app
-swift test                  # 193 engine tests, all green (the badge-container one asserts whichever case this Mac is in)
+swift test                  # 248 engine tests, all green (the badge-container one asserts whichever case this Mac is in)
 swift run NeoDrop           # menu bar icon appears immediately (reads/writes ~/Library/Application Support/NeoDrop)
 ```
 
@@ -464,10 +476,10 @@ Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, the 
   VaultStatus.swift      per-folder display state for the menu and Settings
 Sources/NeoDropShared/   the badge format, shared by the app and the Finder extension
 Sources/NeoDropFinder/   the Finder Sync extension: the badges next to a file's date
-Tests/NeoDropCoreTests/  238 tests: one per safety rule above, plus the vault (including the paged
-                         catch-up and its cursor), the Activity window's filtering and wording,
-                         web-UI parsing, path and badge cases — the container one asserts both
-                         sides of the signing rule
+Tests/NeoDropCoreTests/  251 tests: one per safety rule above, plus the vault (the paged catch-up and
+                         its cursor, and the one-pass settle when there is nothing to do), the
+                         Activity window's filtering and wording, web-UI parsing, path and badge
+                         cases — the container one asserts both sides of the signing rule
 Resources/AppIcon.png    master app-icon artwork, masked by scripts/make-icon.swift
 Resources/MenuBarIcon*.png  menu bar template icon at 1x/2x/3x, plus the .svg master
 Resources/dmg-background.png  installer window wallpaper, as supplied (the master)
@@ -599,6 +611,17 @@ Deliberate omissions and known gaps, roughly in order of value:
   sync continues where the last one ended. A failure leaves the checkpoint at the last complete page,
   so a retry safely repeats work rather than skipping it. This bounds per-pass file reconciliation;
   scanning and reading the journal still cover the full local tree and vault metadata.
+  The other half of that cost is now paid too: a folder that already agrees with the vault settles in
+  a **single pass** rather than being walked page by page every fifteen minutes — measured on a
+  5,000-path vault, ten passes and sixteen seconds became one pass and about one and a half seconds —
+  with the journals' byte sizes as the exact proof that nothing has been published in between.
+  That pass reads the journal **once**: it used to read and decode every journal a second time just to
+  find out which entry number to write next, which on a vault with a long history was the largest
+  single cost in it (measured on a 1,200-path vault with 2,400 journal entries: 172 ms of a 578 ms
+  pass, now 382 ms with one read). What is not bounded yet is that one read: every pass decodes every
+  line of a journal that only ever grows, so a vault in use for years pays more each sync for the same
+  unchanged tree. Reading only the lines since the last pass — the record of which is the same byte
+  size the settle already trusts — is the next thing to build here.
 * **A share that disagrees with its own journal.** A file deleted or truncated *on the share* is put
   back from retained content, and the bytes on the share are checked by size on every sync; a
   same-size corruption needs **Verify & Repair** (which re-hashes). An index of what the share holds

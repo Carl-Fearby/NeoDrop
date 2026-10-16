@@ -196,6 +196,10 @@ public actor VaultSync {
             return finish(&summary, phase: .failed("The vault is newer than this app"), error: VaultError.newerFormat(identity.formatVersion))
         }
 
+        // Journal sizes are read before anything this pass writes, so a machine that appends while we
+        // are working leaves the record behind reality and the next pass walks. See
+        // `VaultCursor.catchUpJournalBytes`.
+        let journalBytes = store.journalSizes()
         let loaded = store.loadEntries()
         summary.errors.append(contentsOf: loaded.errors)
         var state = store.state(from: loaded.entries)
@@ -265,22 +269,71 @@ public actor VaultSync {
         // leave it invisible on every Mac forever.
         let undeletes = PendingUndeleteStore(paths: paths)
         let pendingUndeletes = undeletes.load(linkID: link.id)
-        var journal = JournalWriter(seq: store.nextSequence(machineID: machine.id.uuidString))
+        var journal = JournalWriter(seq: Self.nextSequence(in: loaded.entries, machineID: machine.id.uuidString))
         var adopted = 0
-        for path in store.untrackedFiles(known: existingJournalKeys, excludes: excludes) {
-            let key = VaultPath.key(path)
+        // One walk of the share answers everything this pass needs from it: what is in the live
+        // tree, of what size, and what nobody has claimed. Per path it would be one round trip each.
+        let live = store.liveTree(excludes: excludes)
+        var liveByKey: [String: (path: String, size: Int64)] = [:]
+        for file in live where liveByKey[file.key] == nil {
+            liveByKey[file.key] = (file.path, file.size)
+        }
+        for file in live where !existingJournalKeys.contains(file.key) {
+            let path = file.path
+            let key = file.key
             guard local[key] == nil else { continue }
             let url = store.fileURL(for: path)
             guard let sha = try? Hashing.sha256(ofFileAt: url) else {
                 summary.errors.append("\(path): a file in the vault could not be read")
                 continue
             }
-            let size = FileMeta.size(ofFileAt: url) ?? 0
+            let size = file.size
             journal.add(machine: machine, path: path, kind: .create, size: size, sha: sha, previous: nil)
             state.files[key] = journal.entries[journal.entries.count - 1]
             adopted += 1
         }
         summary.adoptedInVault = adopted
+
+        // MARK: a tree with nothing to do
+        //
+        // A sync used to walk the whole tree every time, in pages of `catchUpBatchSize`, and every
+        // pass re-scanned this folder and re-walked the share. Measured on a 5,000-path vault that
+        // was ten passes and sixteen seconds for a sync that changed nothing — every fifteen
+        // minutes, for ever. The page exists to bound *work*; a tree with nothing to do has none,
+        // so it is settled here: one scan of the folder (already done), one walk of the share
+        // (already done), and no per-path plan.
+        //
+        // Everything that could make the tree interesting is asked cheaply and exactly:
+        //   * has any journal grown? Byte sizes, not timestamps: two entries can share a
+        //     millisecond, and a change missed here would be missed for ever;
+        //   * does this machine's folder still hold exactly what the vault says it holds?
+        //   * has anyone dropped a file into the share by hand, and did the last pass leave
+        //     something it wanted to look at again?
+        let journalUnchanged = store.journalSizes() == cursor.catchUpJournalBytes
+        let folderAgreesWithVault = Set(local.keys) == existingJournalKeys
+            && local.allSatisfy { key, item in state.files[key]?.sha256 == item.sha }
+        let walkFinished = cursor.catchUpAfter == nil && (cursor.catchUpDirtyPaths ?? []).isEmpty
+        if journalUnchanged, folderAgreesWithVault, adopted == 0, walkFinished, cursor.catchUpJournalBytes != nil {
+            return settle(
+                summary: &summary,
+                store: store,
+                state: state,
+                live: liveByKey,
+                local: local,
+                loadedEntries: loaded.entries,
+                base: &base,
+                cursor: &cursor,
+                cursorStore: cursorStore,
+                index: indexed.index,
+                indexStore: indexStore,
+                link: link,
+                paths: paths,
+                undeletes: undeletes,
+                journalBytes: journalBytes,
+                now: Date(),
+                progress: progress
+            )
+        }
 
         // MARK: plan
         let allKeys = Set(state.files.keys).union(state.tombstones.keys).union(local.keys).union(base.keys)
@@ -595,6 +648,10 @@ public actor VaultSync {
             // What the journal held when this pass finished, so the next one can tell what arrived
             // while it was behind without trusting two differently-rounded timestamps.
             cursor.catchUpSeenAt = max(cursor.catchUpSeenAt ?? 0, loaded.entries.map { Self.millis($0.at) }.max() ?? 0)
+            // The journal sizes this pass *opened* with. A pass that published has therefore
+            // recorded less than the journal now holds, and the next pass walks rather than settling
+            // — which is what we want: something changed, and it was us.
+            cursor.catchUpJournalBytes = journalBytes
             cursor.lastSync = now
             do {
                 try cursorStore.save(cursor)
@@ -630,6 +687,100 @@ public actor VaultSync {
     /// them too.
     static func millis(_ date: Date) -> Int64 {
         Int64((date.timeIntervalSince1970 * 1000).rounded())
+    }
+
+    /// The next sequence number for this machine's journal, from entries this pass already read.
+    ///
+    /// `VaultStore.nextSequence` answers the same question by reading and decoding *every* journal
+    /// again, and a pass reads them all anyway (`loaded`, above) before it needs a sequence — so
+    /// that second read was pure duplication on the most expensive thing a pass does. Measured on a
+    /// 1,200-path vault whose journal held 2,400 entries: 172 ms of a 578 ms pass, every fifteen
+    /// minutes, growing with the vault's history rather than with its size.
+    static func nextSequence(in entries: [JournalEntry], machineID: String) -> Int {
+        (entries.lazy.filter { $0.machine == machineID }.map(\.seq).max() ?? 0) + 1
+    }
+
+    /// A pass over a tree that already agrees with the vault, in one go instead of `N/500` of them.
+    ///
+    /// The journal cannot answer two questions, so the share is asked them here — but by the walk
+    /// this pass already made, not by a stat per path: is every file the journal claims still on the
+    /// share at the size it recorded (repair it if not), and is anything in the live tree
+    /// unclaimed? (A quiet pass only reaches here with nothing unclaimed, because an adoption is
+    /// work, and this is not the pass that does work.)
+    ///
+    /// Retention still runs: the thirty-day window closes on the clock, not on changes, and a
+    /// restore that undid a deletion has to stop being one on the next sync whatever else happens.
+    private func settle(
+        summary: inout VaultSyncSummary,
+        store: VaultStore,
+        state: VaultState,
+        live: [String: (path: String, size: Int64)],
+        local: [String: (file: ScannedFile, sha: String)],
+        loadedEntries: [JournalEntry],
+        base: inout [String: String],
+        cursor: inout VaultCursor,
+        cursorStore: VaultCursorStore,
+        index: SourceIndex,
+        indexStore: SourceIndexStore,
+        link: VaultLink,
+        paths: StorePaths,
+        undeletes: PendingUndeleteStore,
+        journalBytes: [String: Int64],
+        now: Date,
+        progress: @Sendable (SyncProgress) -> Void
+    ) -> VaultSyncSummary {
+        for (key, entry) in state.files {
+            let sizeOnShare = live[key]?.size
+            guard sizeOnShare != entry.size else { continue }
+            let what = sizeOnShare == nil
+                ? "the vault copy is missing"
+                : "the vault copy is not the size the journal records"
+            guard let own = local[key]?.file, Self.repairVaultFile(store: store, path: entry.path, from: own.url) else {
+                summary.errors.append("\(entry.path): \(what) and could not be restored")
+                continue
+            }
+            summary.repairs.append(entry.path)
+        }
+
+        summary.versionsPurged = store.purgeVersions(
+            keeping: store.retainableVersions(from: loadedEntries, within: DeleteRecord.retention, now: now),
+            olderThan: DeleteRecord.retention,
+            now: now
+        )
+        if summary.errors.isEmpty {
+            undeletes.prune(keeping: Set(state.tombstones.keys), linkID: link.id)
+        }
+        reconcileLocalDeleteRecords(link: link, local: local, deleteStore: DeleteStore(paths: paths))
+
+        // The merge base is the vault's own answer for every path, because the two agree on all of
+        // them. Writing it here is what keeps the *next* change from being read as a conflict.
+        for (key, entry) in state.files { base[key] = entry.sha256 }
+        for key in state.tombstones.keys where state.files[key] == nil { base[key] = "" }
+
+        cursor.applied = base
+        cursor.catchUpAfter = nil
+        cursor.catchUpDirtyPaths = nil
+        cursor.catchUpJournalBytes = journalBytes
+        cursor.catchUpSeenAt = max(cursor.catchUpSeenAt ?? 0, loadedEntries.map { Self.millis($0.at) }.max() ?? 0)
+        cursor.lastSync = now
+        do {
+            try cursorStore.save(cursor)
+            try indexStore.save(index)
+        } catch {
+            summary.errors.append("Could not save sync progress: \(error.localizedDescription)")
+        }
+
+        summary.upToDate = state.fileCount
+        summary.filesInVault = state.fileCount
+        summary.catchUpProcessed = 0
+        summary.catchUpPending = false
+        progress(SyncProgress(
+            phase: .finished,
+            replicaName: link.displayName,
+            filesTotal: state.fileCount,
+            filesDone: state.fileCount
+        ))
+        return finish(&summary, phase: summary.isDegraded ? .failed(summary.errors[0]) : .finished)
     }
 
     /// Keep this machine's retention list honest, the same way the mirror engine does.

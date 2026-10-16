@@ -766,14 +766,21 @@ final class VaultSyncTests: XCTestCase {
                        "moved \(resumed.bytesDown) bytes for a 23-file remainder")
         XCTAssertGreaterThan(resumed.bytesDown, 0, "the remainder really did move")
 
-        // An idle pass afterwards moves nothing, and the cleared cursor makes it walk from the top
-        // again — bounded, and finding every path already agreed on.
+        // An idle pass afterwards moves nothing and pages nothing: a tree in agreement is settled
+        // in one pass rather than re-walked a page at a time (see testASyncWithNothingToDoSettles
+        // InOnePass), and every path still counts as agreed.
         let settled = try await sandbox.sync(1)
         XCTAssertEqual(settled.downloaded, 0)
         XCTAssertEqual(settled.uploaded, 0)
-        XCTAssertEqual(settled.catchUpProcessed, VaultSync.catchUpBatchSize)
-        XCTAssertEqual(settled.upToDate, VaultSync.catchUpBatchSize)
+        XCTAssertEqual(settled.catchUpProcessed, 0, "nothing to walk, so nothing is paged")
+        XCTAssertEqual(settled.upToDate, total)
+        XCTAssertFalse(settled.catchUpPending)
         XCTAssertEqual(sandbox.localFiles(machine: 1).count, total)
+        let vaultID = try XCTUnwrap(VaultStore(root: sandbox.vault).loadIdentity()?.id)
+        let cursorStore = VaultCursorStore(paths: sandbox.machines[1].state)
+        let settledCursor = try XCTUnwrap(cursorStore.load(vaultID: vaultID))
+        XCTAssertNil(settledCursor.catchUpAfter)
+        XCTAssertNotNil(settledCursor.catchUpJournalBytes, "the settled pass records what it saw")
     }
 
     /// A deletion is the other thing a cursor can walk past, and the more dangerous one: a file the
@@ -876,6 +883,34 @@ final class VaultSyncTests: XCTestCase {
         XCTAssertEqual(after.errors, [])
         XCTAssertEqual(after.upToDate, 1)
         XCTAssertEqual(try sandbox.vaultRead("alpha.txt"), "alpha")
+    }
+
+    /// The sequence a pass writes into the journal has to be the one the journal would have given
+    /// it. It is derived from the entries the pass already read rather than from a second full read
+    /// of every journal — the most expensive thing a pass does, done twice, growing with the
+    /// vault's history rather than its size.
+    func testTheSequenceComesFromTheEntriesThePassAlreadyRead() async throws {
+        try sandbox.write("alpha", machine: 0, to: "alpha.txt")
+        try await sandbox.sync(0)
+        try await sandbox.sync(1)
+        try sandbox.write("beta", machine: 0, to: "beta.txt")
+        try sandbox.write("gamma", machine: 1, to: "gamma.txt")
+        try await sandbox.sync(0)
+        try await sandbox.sync(1)
+
+        let store = VaultStore(root: sandbox.vault)
+        let entries = store.loadEntries().entries
+        for machine in sandbox.machines {
+            let mine = entries.filter { $0.machine == machine.id.uuidString }.map(\.seq).sorted()
+            if !mine.isEmpty {
+                XCTAssertEqual(mine, Array(1...mine.count), "per-machine sequences stay consecutive")
+            }
+            XCTAssertEqual(
+                VaultSync.nextSequence(in: entries, machineID: machine.id.uuidString),
+                store.nextSequence(machineID: machine.id.uuidString),
+                "the derived sequence must match what re-reading the journal answers"
+            )
+        }
     }
 
     func testBytesOnTheShareWithoutAJournalLineAreAnnouncedByTheNextSync() async throws {
