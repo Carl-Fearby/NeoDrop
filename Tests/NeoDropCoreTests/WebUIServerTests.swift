@@ -9,6 +9,8 @@ final class WebUIServerTests: XCTestCase {
     final class Stub: @unchecked Sendable {
         private let lock = NSLock()
         private var list: [DeletionEntry] = []
+        private var foreign: [ForeignCopyEntry] = []
+        private var replacedCopies: [(String, UUID, String)] = []
         private var restoredPaths: [String] = []
         private var failure: Error?
         private var restoredTo = "/tmp/Source/alpha.txt"
@@ -17,6 +19,9 @@ final class WebUIServerTests: XCTestCase {
 
         func setFailure(_ error: Error?) { lock.lock(); failure = error; lock.unlock() }
         func setRestoredTo(_ path: String) { lock.lock(); restoredTo = path; lock.unlock() }
+        func setForeign(_ entries: [ForeignCopyEntry]) { lock.lock(); foreign = entries; lock.unlock() }
+        func foreignEntries() -> [ForeignCopyEntry] { lock.lock(); defer { lock.unlock() }; return foreign }
+        func replaced() -> [(String, UUID, String)] { lock.lock(); defer { lock.unlock() }; return replacedCopies }
         func restored() -> [String] { lock.lock(); defer { lock.unlock() }; return restoredPaths }
 
         func listEntries() -> [DeletionEntry] { lock.lock(); defer { lock.unlock() }; return list }
@@ -26,6 +31,16 @@ final class WebUIServerTests: XCTestCase {
             let failure = self.failure
             let destination = restoredTo
             if failure == nil { restoredPaths.append(relativePath) }
+            lock.unlock()
+            if let failure { throw failure }
+            return URL(fileURLWithPath: destination)
+        }
+
+        func replaceForeign(_ relativePath: String, _ replicaID: UUID, _ sha256: String) throws -> URL {
+            lock.lock()
+            let failure = self.failure
+            let destination = restoredTo
+            if failure == nil { replacedCopies.append((relativePath, replicaID, sha256)) }
             lock.unlock()
             if let failure { throw failure }
             return URL(fileURLWithPath: destination)
@@ -40,10 +55,13 @@ final class WebUIServerTests: XCTestCase {
         var all: [String] { lock.lock(); defer { lock.unlock() }; return paths }
     }
 
-    private func start(stub: Stub, status: WebUIServer.StatusHandler? = nil) async throws -> (WebUIServer, URL) {
+    private func start(stub: Stub, status: WebUIServer.StatusHandler? = nil,
+                       foreign: Bool = false) async throws -> (WebUIServer, URL) {
         let server = WebUIServer(
             list: { stub.listEntries() },
             restore: { path in try stub.restore(path) },
+            foreignList: foreign ? { stub.foreignEntries() } : nil,
+            replaceForeign: foreign ? { path, replicaID, sha in try stub.replaceForeign(path, replicaID, sha) } : nil,
             status: status
         )
         let url = try await server.start()
@@ -86,7 +104,18 @@ final class WebUIServerTests: XCTestCase {
         var path: String
     }
 
-    private static func entry(_ relativePath: String, available: Bool = true) -> DeletionEntry {
+    private struct ForeignJSON: Decodable {
+        var files: [ForeignCopyEntry]
+    }
+
+    private struct ReplaceForeignJSON: Decodable {
+        var ok: Bool
+        var path: String
+        var replacedAt: String
+    }
+
+    private static func entry(_ relativePath: String, available: Bool = true,
+                              reason: DeleteRecord.Reason = .deleted) -> DeletionEntry {
         DeletionEntry(
             relativePath: relativePath,
             sourcePath: "/tmp/Source/" + relativePath,
@@ -97,7 +126,8 @@ final class WebUIServerTests: XCTestCase {
             copies: [
                 DeletionCopy(replicaID: UUID(), replicaName: "NAS1", available: available),
                 DeletionCopy(replicaID: UUID(), replicaName: "NAS2", available: available),
-            ]
+            ],
+            reason: reason
         )
     }
 
@@ -120,6 +150,18 @@ final class WebUIServerTests: XCTestCase {
         XCTAssertTrue(html.contains("Deleted Files"))
         XCTAssertTrue(html.contains("\(DeleteRecord.retentionDays) days"), "the page states the retention window")
         XCTAssertTrue(html.contains("api/restore"), "the page talks to the API relatively, without the token in markup")
+        XCTAssertTrue(html.contains("id=\"search\""), "the retained versions can be searched by path")
+        XCTAssertTrue(html.contains("data-filter=\"deleted\""), "deleted files have their own filter")
+        XCTAssertTrue(html.contains("data-filter=\"replaced\""), "replaced versions have their own filter")
+        XCTAssertTrue(html.contains("SHA-256:"), "the browser exposes the version checksum")
+        XCTAssertTrue(html.contains("Restores to:"), "the browser shows where a restore will land")
+        XCTAssertTrue(html.contains("window.confirm"), "replacing the current file requires confirmation")
+        XCTAssertTrue(html.contains("api/foreign"), "the recovery window loads unresolved share conflicts")
+        XCTAssertTrue(html.contains("Replace with source"), "conflicts have an explicit resolution action")
+        XCTAssertTrue(html.contains("The share currently has"), "confirmation includes what is on the share")
+        XCTAssertTrue(html.contains("keeps the share copy for"), "confirmation explains the recovery safety net")
+        XCTAssertTrue(html.contains("allFiles.filter"), "search and reason filters are applied to the loaded list")
+        XCTAssertTrue(html.contains("Version details"), "each retained item can expand its details")
         XCTAssertFalse(html.contains(url.lastPathComponent), "the token is not written into the page")
     }
 
@@ -156,6 +198,127 @@ final class WebUIServerTests: XCTestCase {
         XCTAssertEqual(payload.files.map(\.relativePath), ["Documents/report.txt", "Photos/a.jpg"])
         XCTAssertTrue(payload.files[0].restorable)
         XCTAssertFalse(payload.files[1].restorable, "one offline destination is still restorable, both are not")
+    }
+
+    /// The page labels each row by why the bytes were kept, so the reason has to survive the wire.
+    func testDeletionsRouteCarriesWhatHappenedToEachVersion() async throws {
+        let stub = Stub(entries: [Self.entry("Documents/report.txt", reason: .replaced),
+                                  Self.entry("Photos/a.jpg")])
+        let (server, url) = try await start(stub: stub)
+        defer { server.stop() }
+
+        let (data, response) = try await URLSession.shared.data(from: url.appendingPathComponent("api/deletions"))
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let payload = try decoder.decode(DeletionsJSON.self, from: data)
+
+        XCTAssertEqual(payload.files.map(\.reason), [.replaced, .deleted],
+                       "a replaced version is not presented as a deletion")
+    }
+
+    func testThePageCanLabelAReplacedVersionAsWellAsADeletion() async throws {
+        let (server, url) = try await start(stub: Stub())
+        defer { server.stop() }
+        let (data, _) = try await URLSession.shared.data(from: url)
+        let html = String(decoding: data, as: UTF8.self)
+
+        XCTAssertTrue(html.contains("entry.reason"), "the row's label depends on why the bytes were kept")
+        XCTAssertTrue(html.contains("'replaced '"), "and it says replaced rather than deleted")
+    }
+
+    func testForeignRouteReturnsTheConflictsAndTheirExpectedDigest() async throws {
+        let replicaID = UUID()
+        let sha256 = String(repeating: "c", count: 64)
+        let stub = Stub()
+        stub.setForeign([ForeignCopyEntry(
+            relativePath: "Docs/report.txt", replicaID: replicaID, replicaName: "NAS1",
+            absolutePath: "/Volumes/NAS1/Docs/report.txt", sourcePath: "/Users/anna/Docs/report.txt",
+            size: 42, sha256: sha256, replaceable: true
+        )])
+        let (server, url) = try await start(stub: stub, foreign: true)
+        defer { server.stop() }
+
+        let (data, response) = try await URLSession.shared.data(from: url.appendingPathComponent("api/foreign"))
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        let payload = try JSONDecoder().decode(ForeignJSON.self, from: data)
+        XCTAssertEqual(payload.files.count, 1)
+        XCTAssertEqual(payload.files[0].relativePath, "Docs/report.txt")
+        XCTAssertEqual(payload.files[0].replicaID, replicaID)
+        XCTAssertEqual(payload.files[0].sha256, sha256)
+        XCTAssertTrue(payload.files[0].replaceable)
+    }
+
+    func testReplaceForeignRoutePassesTheDigestAndReplicaIdentityThrough() async throws {
+        let replicaID = UUID()
+        let sha256 = String(repeating: "d", count: 64)
+        let stub = Stub()
+        stub.setRestoredTo("/Volumes/NAS1/Docs/report.txt")
+        let (server, url) = try await start(stub: stub, foreign: true)
+        defer { server.stop() }
+
+        var request = URLRequest(url: url.appendingPathComponent("api/foreign/replace"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "relativePath": "Docs/report.txt", "replicaID": replicaID.uuidString,
+            "expectedSHA256": sha256
+        ])
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(stub.replaced().count, 1)
+        XCTAssertEqual(stub.replaced()[0].0, "Docs/report.txt")
+        XCTAssertEqual(stub.replaced()[0].1, replicaID)
+        XCTAssertEqual(stub.replaced()[0].2, sha256)
+        let payload = try JSONDecoder().decode(ReplaceForeignJSON.self, from: data)
+        XCTAssertTrue(payload.ok)
+        XCTAssertEqual(payload.path, "Docs/report.txt")
+        XCTAssertEqual(payload.replacedAt, "/Volumes/NAS1/Docs/report.txt")
+    }
+
+    func testReplaceForeignRouteRejectsMalformedDigestBeforeCallingHandler() async throws {
+        let stub = Stub()
+        let (server, url) = try await start(stub: stub, foreign: true)
+        defer { server.stop() }
+
+        var request = URLRequest(url: url.appendingPathComponent("api/foreign/replace"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(#"{"relativePath":"Docs/report.txt","replicaID":"11111111-1111-1111-1111-111111111111","expectedSHA256":"not-a-hash"}"#.utf8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 400)
+        XCTAssertTrue(stub.replaced().isEmpty)
+        XCTAssertTrue(String(decoding: data, as: UTF8.self).contains("expectedSHA256"))
+    }
+
+    func testForeignRoutesAreAbsentWithoutHandlers() async throws {
+        let (server, url) = try await start(stub: Stub())
+        defer { server.stop() }
+
+        let (_, getResponse) = try await URLSession.shared.data(from: url.appendingPathComponent("api/foreign"))
+        XCTAssertEqual((getResponse as? HTTPURLResponse)?.statusCode, 404)
+    }
+
+    func testARestoreRefusedForAnUnsyncedNewerVersionIsAConflict() async throws {
+        let stub = Stub()
+        stub.setFailure(NeoDropError.restoreWouldLoseNewerWork("/tmp/Source/alpha.txt"))
+        let (server, url) = try await start(stub: stub)
+        defer { server.stop() }
+
+        var request = URLRequest(url: url.appendingPathComponent("api/restore"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(#"{"relativePath":"alpha.txt"}"#.utf8)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+
+        XCTAssertEqual(http.statusCode, 409, "the request is fine; the timing is not")
+        let message = String(decoding: data, as: UTF8.self)
+        XCTAssertTrue(message.contains("has not reached a mounted destination"),
+                      "the page shows the user why, and what to do about it: \(message)")
     }
 
     func testRestoreRouteCallsThroughToTheEngine() async throws {

@@ -29,6 +29,9 @@ public enum WebUIError: Error, LocalizedError {
 public final class WebUIServer: @unchecked Sendable {
     public typealias ListHandler = @Sendable () async -> [DeletionEntry]
     public typealias RestoreHandler = @Sendable (_ relativePath: String) async throws -> URL
+    public typealias ForeignListHandler = @Sendable () async -> [ForeignCopyEntry]
+    public typealias ReplaceForeignHandler = @Sendable (_ relativePath: String, _ replicaID: UUID,
+                                                         _ expectedSHA256: String) async throws -> URL
     /// Answers "what does NeoDrop know about this path?" — the Finder service's back end. Returns
     /// nil when the app cannot answer at all, which the page reports as a missing file rather than
     /// as an empty report.
@@ -40,6 +43,8 @@ public final class WebUIServer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "ai.storyteller.neodrop.webui")
     private let listHandler: ListHandler
     private let restoreHandler: RestoreHandler
+    private let foreignListHandler: ForeignListHandler?
+    private let replaceForeignHandler: ReplaceForeignHandler?
     private let statusHandler: StatusHandler?
     /// Random per launch and never persisted: the page URL is not a credential that outlives the
     /// run it was printed for.
@@ -48,15 +53,19 @@ public final class WebUIServer: @unchecked Sendable {
     private var listener: NWListener?
     private var liveConnections: [NWConnection] = []
 
-    /// `status` is optional so the deleted-files half of the server can be constructed — and
-    /// tested — on its own; the route answers 404 until a handler is supplied.
+    /// Optional handlers allow the server's existing use in deleted-files-only contexts and tests;
+    /// conflict routes answer 404 until the app supplies both handlers.
     public init(
         list: @escaping ListHandler,
         restore: @escaping RestoreHandler,
+        foreignList: ForeignListHandler? = nil,
+        replaceForeign: ReplaceForeignHandler? = nil,
         status: StatusHandler? = nil
     ) {
         self.listHandler = list
         self.restoreHandler = restore
+        self.foreignListHandler = foreignList
+        self.replaceForeignHandler = replaceForeign
         self.statusHandler = status
     }
 
@@ -212,16 +221,52 @@ public final class WebUIServer: @unchecked Sendable {
             return .html(WebUIPage.html(retentionDays: DeleteRecord.retentionDays))
         case ("GET", "/api/deletions"):
             return await deletionsResponse()
+        case ("GET", "/api/foreign"):
+            return await foreignResponse()
+        case ("POST", "/api/foreign/replace"):
+            return await replaceForeignResponse(for: request)
         case ("GET", "/status"):
             return await statusResponse(request)
         case ("POST", "/api/restore"):
             return await restoreResponse(for: request)
-        case (_, "/"), (_, ""), (_, "/api/deletions"):
+        case (_, "/"), (_, ""), (_, "/api/deletions"), (_, "/api/foreign"):
             return .text(status: 405, "Method not allowed")
-        case (_, "/api/restore"):
+        case (_, "/api/restore"), (_, "/api/foreign/replace"):
             return .text(status: 405, "Method not allowed")
         default:
             return .text(status: 404, "Not found")
+        }
+    }
+
+    private func foreignResponse() async -> HTTPResponse {
+        guard let foreignListHandler else { return .text(status: 404, "Not found") }
+        do {
+            return try .json(status: 200, ForeignCopiesPayload(files: await foreignListHandler()))
+        } catch {
+            return .text(status: 500, "Could not encode the foreign-file list")
+        }
+    }
+
+    private func replaceForeignResponse(for request: HTTPRequest) async -> HTTPResponse {
+        guard let replaceForeignHandler else { return .text(status: 404, "Not found") }
+        guard let body = ReplaceForeignRequest.decode(request.body),
+              !body.relativePath.isEmpty,
+              !body.expectedSHA256.isEmpty,
+              body.expectedSHA256.count == 64,
+              body.expectedSHA256.allSatisfy({ $0.isHexDigit }) else {
+            return .jsonError(status: 400, message: "Expected {relativePath, replicaID, expectedSHA256}")
+        }
+        do {
+            let destination = try await replaceForeignHandler(
+                body.relativePath, body.replicaID, body.expectedSHA256
+            )
+            return try .json(status: 200, ReplaceForeignResponse(
+                ok: true, path: body.relativePath, replacedAt: destination.path
+            ))
+        } catch let error as NeoDropError {
+            return .jsonError(status: Self.status(for: error), message: error.localizedDescription)
+        } catch {
+            return .jsonError(status: 500, message: error.localizedDescription)
         }
     }
 
@@ -270,8 +315,9 @@ public final class WebUIServer: @unchecked Sendable {
 
     private static func status(for error: NeoDropError) -> Int {
         switch error {
-        case .retainedCopyUnavailable: return 404
-        case .restoreConflict, .restoreSourceUnavailable: return 409
+        case .retainedCopyUnavailable, .foreignCopyUnavailable: return 404
+        case .restoreConflict, .restoreSourceUnavailable, .restoreWouldLoseNewerWork,
+             .foreignCopyChanged, .foreignCopyRetentionFailed: return 409
         default: return 500
         }
     }
@@ -292,6 +338,27 @@ struct RestoreRequest: Decodable {
         guard !body.isEmpty else { return nil }
         return try? JSONDecoder().decode(RestoreRequest.self, from: body)
     }
+}
+
+struct ForeignCopiesPayload: Encodable {
+    var files: [ForeignCopyEntry]
+}
+
+struct ReplaceForeignRequest: Decodable {
+    var relativePath: String
+    var replicaID: UUID
+    var expectedSHA256: String
+
+    static func decode(_ body: Data) -> ReplaceForeignRequest? {
+        guard !body.isEmpty else { return nil }
+        return try? JSONDecoder().decode(ReplaceForeignRequest.self, from: body)
+    }
+}
+
+struct ReplaceForeignResponse: Encodable {
+    var ok: Bool
+    var path: String
+    var replacedAt: String
 }
 
 struct RestoreResponse: Encodable {

@@ -318,7 +318,7 @@ WEB_URL="$(grep -o 'Deleted files view ready at http://127.0.0.1:[0-9]*/[a-f0-9]
 if [ -n "$WEB_URL" ]; then
   pass "the app started its deleted-files view"
 
-  if curl -fsS --max-time 10 "$WEB_URL" | grep -q "Deleted Files"; then
+  if curl -fsS --max-time 10 "$WEB_URL" | grep -q "Deleted Files &amp; Versions"; then
     pass "the deleted-files page is served on loopback"
   else
     fail "the deleted-files page did not load from $WEB_URL"
@@ -406,6 +406,135 @@ else
   fail "the activity log has no completed sync"
 fi
 
+# ---- the version a copy replaces ----------------------------------------------------------------
+# An edit to a mirrored file replaces the bytes NeoDrop itself wrote, and with no version control
+# behind it those bytes would afterwards exist nowhere. They are kept the way a deletion is kept — in
+# the trash, recorded, offered by the same page — and restoring them must put the earlier version
+# back without losing the newer one. Staged as an ordinary edit: write a file, let it sync, edit it,
+# let that sync.
+VERSION_RELATIVE="Documents/2026/plans.txt"
+printf 'the first version\n' > "$SOURCE/$VERSION_RELATIVE"
+# Wait for the *contents*, not for the path: this file is mirrored from earlier in the run, so its
+# existence says nothing about whether the sync has caught up with this write.
+DEADLINE=$((SECONDS + 40))
+while [ $SECONDS -lt $DEADLINE ]; do
+  grep -q 'the first version' "$NAS1/$VERSION_RELATIVE" 2>/dev/null \
+    && grep -q 'the first version' "$NAS2/$VERSION_RELATIVE" 2>/dev/null && break
+  sleep 1
+done
+FIRST_VERSION_DIGEST="$(shasum -a 256 "$SOURCE/$VERSION_RELATIVE" | cut -d' ' -f1)"
+if grep -q 'the first version' "$NAS1/$VERSION_RELATIVE" 2>/dev/null \
+   && grep -q 'the first version' "$NAS2/$VERSION_RELATIVE" 2>/dev/null; then
+  pass "a new version of a mirrored file reached both replicas"
+else
+  fail "the first version never reached both replicas, so the replacement cannot be checked"
+fi
+printf 'the second version\n' > "$SOURCE/$VERSION_RELATIVE"
+DEADLINE=$((SECONDS + 40))
+while [ $SECONDS -lt $DEADLINE ]; do
+  grep -q 'the second version' "$NAS1/$VERSION_RELATIVE" 2>/dev/null && break
+  sleep 1
+done
+
+if grep -q 'the second version' "$NAS1/$VERSION_RELATIVE" 2>/dev/null \
+   && grep -q 'the second version' "$NAS2/$VERSION_RELATIVE" 2>/dev/null; then
+  pass "an edit replaced the mirrored file on both replicas"
+else
+  fail "the edit did not reach both replicas"
+fi
+
+for volume in NAS1 NAS2; do
+  KEPT="$WORK/$volume/NeoDrop/.neodrop-trash/$VERSION_RELATIVE"
+  if [ ! -f "$KEPT" ]; then
+    fail "$volume did not keep the version the copy replaced"
+  elif [ "$(shasum -a 256 "$KEPT" | cut -d' ' -f1)" != "$FIRST_VERSION_DIGEST" ]; then
+    fail "$volume kept different bytes than the version that was replaced"
+  else
+    pass "$volume keeps the replaced version, digest for digest"
+  fi
+done
+
+if python3 - "$STATE/deletes" "$VERSION_RELATIVE" <<'PY'
+import json, glob, os, sys
+directory, relative = sys.argv[1], sys.argv[2]
+matches = [record
+           for path in glob.glob(os.path.join(directory, "*.json"))
+           for record in json.load(open(path))
+           if record["relativePath"] == relative]
+assert len(matches) == 2, f"expected one record per replica, found {len(matches)}"
+for record in matches:
+    assert record["reason"] == "replaced", record["reason"]
+    assert record["sha256"], "the record carries no digest to verify a restore against"
+    assert record["sourcePath"].endswith("Source/" + relative), record["sourcePath"]
+PY
+then
+  pass "a 'replaced' record with a digest was written for each replica"
+else
+  fail "no usable record of the replaced version"
+fi
+
+if [ -n "$WEB_URL" ]; then
+  if curl -fsS --max-time 10 "${WEB_URL}api/deletions" | python3 -c '
+import json, sys
+entries = {f["relativePath"]: f for f in json.load(sys.stdin)["files"]}
+entry = entries.get("Documents/2026/plans.txt")
+assert entry, f"replaced version not listed: {sorted(entries)}"
+assert entry["reason"] == "replaced", entry["reason"]
+assert entry["restorable"], "the page would offer no working Restore button"
+'; then
+    pass "the page offers the replaced version for recovery, labelled as one"
+  else
+    fail "the deletions API did not list the replaced version"
+  fi
+
+  CODE="$(curl -s -o "$WORK/restore-version.json" -w '%{http_code}' --max-time 30 \
+    -X POST -H 'Content-Type: application/json' \
+    -d '{"relativePath":"Documents/2026/plans.txt"}' "${WEB_URL}api/restore")"
+  if [ "$CODE" = "200" ]; then
+    pass "restoring the previous version returned 200"
+  else
+    fail "restoring the previous version returned $CODE: $(head -c 200 "$WORK/restore-version.json")"
+  fi
+
+  if [ "$(shasum -a 256 "$SOURCE/$VERSION_RELATIVE" | cut -d' ' -f1)" = "$FIRST_VERSION_DIGEST" ]; then
+    pass "the earlier version is back in the source folder, byte for byte"
+  else
+    fail "the source folder does not hold the earlier version: $(cat "$SOURCE/$VERSION_RELATIVE" 2>&1 | head -1)"
+  fi
+
+  # The restore is published by the next sync, and what that sync replaces is now the newer version —
+  # so the latest bytes are still recoverable rather than traded away.
+  DEADLINE=$((SECONDS + 40))
+  while [ $SECONDS -lt $DEADLINE ]; do
+    grep -q 'the first version' "$NAS1/$VERSION_RELATIVE" 2>/dev/null && break
+    sleep 1
+  done
+  if grep -q 'the first version' "$NAS1/$VERSION_RELATIVE" 2>/dev/null \
+     && grep -q 'the first version' "$NAS2/$VERSION_RELATIVE" 2>/dev/null; then
+    pass "the earlier version is mirrored to both replicas again"
+  else
+    fail "the restored version was not re-mirrored"
+  fi
+
+  for volume in NAS1 NAS2; do
+    KEPT="$WORK/$volume/NeoDrop/.neodrop-trash/$VERSION_RELATIVE"
+    if [ -f "$KEPT" ] && grep -q 'the second version' "$KEPT" 2>/dev/null; then
+      pass "$volume still holds the version it just gave up"
+    else
+      fail "$volume lost the newer version when the earlier one came back"
+    fi
+  done
+else
+  fail "the app never logged a deleted-files URL, so the replaced version could not be driven"
+fi
+
+if grep -q "previous version(s) kept for recovery" "$STATE/neodrop.log" 2>/dev/null; then
+  pass "and the run says it kept a previous version"
+  note "$(grep 'previous version(s) kept' "$STATE/neodrop.log" | tail -1 | cut -c1-160)"
+else
+  fail "nothing in the activity log mentions the version that was kept"
+fi
+
 # ---- somebody else's file, where the mirror wants one -------------------------------------------
 # The sharpest promise the engine makes: a file NeoDrop did not write is never replaced. The bytes may
 # exist nowhere else, and a name collision in a shared folder is no reason to lose them. Staged the
@@ -440,6 +569,69 @@ if grep -q "not written by NeoDrop" "$STATE/neodrop.log" 2>/dev/null; then
   note "$(grep 'not written by NeoDrop' "$STATE/neodrop.log" | tail -1 | cut -c1-160)"
 else
   fail "nothing in the activity log mentions the file it left alone"
+fi
+
+# Resolve that conflict through the same in-app endpoint the user clicks. The exact foreign digest
+# is sent as an optimistic-concurrency check; the app retains those share bytes first, then writes
+# the source version and clears the badge. This proves both the data-safety outcome and the actual
+# client-facing action, not just an engine helper.
+if [ -n "$WEB_URL" ]; then
+  FOREIGN_DIGEST="$(shasum -a 256 "$NAS1/$FOREIGN_RELATIVE" | cut -d' ' -f1)"
+  CODE="$(curl -s -o "$WORK/foreign-list.json" -w '%{http_code}' --max-time 10 "${WEB_URL}api/foreign")"
+  if [ "$CODE" = "200" ] && python3 - "$WORK/foreign-list.json" "$FOREIGN_RELATIVE" "$FOREIGN_DIGEST" <<'PY'
+import json, sys
+payload = json.load(open(sys.argv[1]))
+entry = next((f for f in payload["files"] if f["relativePath"] == sys.argv[2]), None)
+assert entry, f"conflict not listed: {[f['relativePath'] for f in payload['files']]}"
+assert entry["sha256"] == sys.argv[3], entry["sha256"]
+assert entry["replaceable"], entry.get("unavailableReason")
+PY
+  then
+    pass "the conflict page lists the share digest and offers the regular file for resolution"
+  else
+    fail "the conflict page did not list a replaceable file: HTTP $CODE"
+  fi
+
+  FOREIGN_REPLICA_ID="$(python3 - "$STATE/config.json" <<'PY'
+import json,sys
+config=json.load(open(sys.argv[1]))
+print(next(r['id'] for r in config['replicas'] if r['name']=='NAS1'))
+PY
+)"
+  CODE="$(curl -s -o "$WORK/foreign-replace.json" -w '%{http_code}' --max-time 30 \
+    -X POST -H 'Content-Type: application/json' \
+    -d "{\"relativePath\":\"$FOREIGN_RELATIVE\",\"replicaID\":\"$FOREIGN_REPLICA_ID\",\"expectedSHA256\":\"$FOREIGN_DIGEST\"}" "${WEB_URL}api/foreign/replace")"
+  if [ "$CODE" = "200" ]; then
+    pass "explicit replacement through the recovery page returned 200"
+  else
+    fail "foreign replacement returned $CODE: $(head -c 240 "$WORK/foreign-replace.json")"
+  fi
+
+  if [ -f "$NAS1/$FOREIGN_RELATIVE" ] \
+     && grep -q "sharing a name with somebody else" "$NAS1/$FOREIGN_RELATIVE" 2>/dev/null; then
+    pass "the source version replaced the conflict on the selected replica"
+  else
+    fail "the selected replica does not hold the source version after resolution"
+  fi
+  if [ -f "$WORK/NAS1/NeoDrop/.neodrop-trash/$FOREIGN_RELATIVE" ] \
+     && grep -q "written by a person" "$WORK/NAS1/NeoDrop/.neodrop-trash/$FOREIGN_RELATIVE" 2>/dev/null; then
+    pass "the share's previous bytes were retained before replacement"
+  else
+    fail "the share's copy was not retained before replacement"
+  fi
+  if curl -fsS --max-time 10 "${WEB_URL}api/foreign" > "$WORK/foreign-after.json" \
+     && python3 - "$WORK/foreign-after.json" "$FOREIGN_RELATIVE" <<'PY'
+import json,sys
+payload=json.load(open(sys.argv[1]))
+assert all(f['relativePath'] != sys.argv[2] for f in payload['files']), payload['files']
+PY
+  then
+    pass "the resolved conflict disappeared from the unresolved list"
+  else
+    fail "the resolved conflict is still listed"
+  fi
+else
+  fail "the app never logged a deleted-files URL, so a conflict could not be resolved through its page"
 fi
 
 # ---- optional: the same app against real mounted volumes ---------------------------------------

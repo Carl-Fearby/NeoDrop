@@ -409,6 +409,9 @@ public struct FileStatusQuery: Sendable {
                 || candidateRels.contains(VaultPath.key(record.relativePath)) {
                 let trash = record.trashURL(onReplicaRoot: replica.url)
                 let present = FileManager.default.fileExists(atPath: trash.path)
+                // The same record serves both reasons, so the row says which one it is instead of
+                // guessing: a deleted file and a replaced version have very different next steps.
+                let replaced = record.reason == .replaced
                 locations.append(FileLocation(
                     role: .retainedCopy,
                     name: replica.displayName,
@@ -416,11 +419,16 @@ public struct FileStatusQuery: Sendable {
                     absolutePath: trash.path,
                     present: present,
                     size: record.size,
-                    recorded: RecordedCopy(kind: "deletion", sha256: record.sha256, size: record.size,
+                    recorded: RecordedCopy(kind: replaced ? "previous version" : "deletion",
+                                           sha256: record.sha256, size: record.size,
                                            at: record.deletedAt, expiresAt: record.expiresAt),
                     note: present
-                        ? "Deleted on \(Self.day(record.deletedAt)); recoverable until \(Self.day(record.expiresAt))."
-                        : "Deletion recorded on \(Self.day(record.deletedAt)), but the retained copy is gone."
+                        ? (replaced
+                           ? "Replaced on \(Self.day(record.deletedAt)); this earlier version is recoverable until \(Self.day(record.expiresAt))."
+                           : "Deleted on \(Self.day(record.deletedAt)); recoverable until \(Self.day(record.expiresAt)).")
+                        : (replaced
+                           ? "Replacement recorded on \(Self.day(record.deletedAt)), but the earlier version is gone."
+                           : "Deletion recorded on \(Self.day(record.deletedAt)), but the retained copy is gone.")
                 ))
             }
         }

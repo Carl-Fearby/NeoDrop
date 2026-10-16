@@ -258,15 +258,34 @@ public struct SourceIndex: Codable, Sendable {
 
 // MARK: - Deleted-file retention
 
-/// A file NeoDrop removed from the mirror but is still holding for recovery.
+/// Bytes NeoDrop took out of the mirror and is still holding for recovery.
 ///
-/// Deletions are recorded instead of destroyed: when a file is gone from every source, each
-/// replica moves its copy into `.neodrop-trash/` at the same relative path and stores a record
-/// here. The bytes are guaranteed until `expiresAt` (30 days after the deletion) — the
-/// "Deleted Files…" web view restores from them — and the purge removes bytes and record
+/// Two things put a version here, and both are recorded, listed and restored the same way:
+///
+/// * a file deleted from every source — each replica moves its copy into `.neodrop-trash/` at the
+///   same relative path and stores a record here;
+/// * the version a newer one replaced — before the sync copies over a file it wrote itself, it
+///   moves the copy that is about to be lost into the same trash directory and records it, so an
+///   edit with no version control behind it is still recoverable for the retention window.
+///
+/// Either way the bytes are guaranteed until `expiresAt` (30 days after they left the mirror) —
+/// the "Deleted Files…" web view restores from them — and the purge removes bytes and record
 /// together after that. A record is only ever dropped once its bytes are gone or provably back
-/// in the source, so a retained copy can never be orphaned by cleaning up the list.
+/// in the source, so a retained copy can never be orphaned by cleaning up the list. One version
+/// is kept per path: a newer retention supersedes an older one for the same file.
 public struct DeleteRecord: Codable, Identifiable, Sendable {
+    /// Why the bytes left the mirror.
+    ///
+    /// Told apart only so the list and the report can say what happened; the recovery path is
+    /// identical. An older build wrote records without this key, which decodes as `.deleted`
+    /// (`testARecordFromAnOlderBuildStillLoads`).
+    public enum Reason: String, Codable, Sendable {
+        /// Every source lost the file, so the mirror followed.
+        case deleted
+        /// The file is still here, but a newer version took its place on the replica.
+        case replaced
+    }
+
     public var id: UUID
     /// The path the file occupied on the mirror (`Photos/a.jpg`) — also its path under `.neodrop-trash/`.
     public var relativePath: String
@@ -276,8 +295,11 @@ public struct DeleteRecord: Codable, Identifiable, Sendable {
     public var size: Int64
     /// Digest of the retained bytes; a restore verifies this before writing anything.
     public var sha256: String
+    /// When these bytes left the mirror. The name predates replacements and is kept for the
+    /// records already on disk; the list labels it by `reason`.
     public var deletedAt: Date
     public var expiresAt: Date
+    public var reason: Reason
 
     public init(
         id: UUID = UUID(),
@@ -286,7 +308,8 @@ public struct DeleteRecord: Codable, Identifiable, Sendable {
         size: Int64,
         sha256: String,
         deletedAt: Date = Date(),
-        expiresAt: Date? = nil
+        expiresAt: Date? = nil,
+        reason: Reason = .deleted
     ) {
         self.id = id
         self.relativePath = relativePath
@@ -295,9 +318,33 @@ public struct DeleteRecord: Codable, Identifiable, Sendable {
         self.sha256 = sha256
         self.deletedAt = deletedAt
         self.expiresAt = expiresAt ?? deletedAt.addingTimeInterval(Self.retention)
+        self.reason = reason
     }
 
-    /// How long a deletion stays recoverable.
+    private enum CodingKeys: String, CodingKey {
+        case id, relativePath, sourcePath, size, sha256, deletedAt, expiresAt, reason
+    }
+
+    /// Decode with a default for the key an older build never wrote.
+    ///
+    /// Same reasoning as `Manifest`: a synthesized decoder would throw on every existing record,
+    /// and a store that cannot be read is a store whose retained copies are unreachable. A
+    /// replacement record from an older build cannot exist, so `.deleted` is the only honest
+    /// answer for a missing key.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(UUID.self, forKey: .id)
+        self.relativePath = try container.decode(String.self, forKey: .relativePath)
+        self.sourcePath = try container.decodeIfPresent(String.self, forKey: .sourcePath) ?? ""
+        self.size = try container.decodeIfPresent(Int64.self, forKey: .size) ?? 0
+        self.sha256 = try container.decodeIfPresent(String.self, forKey: .sha256) ?? ""
+        self.deletedAt = try container.decode(Date.self, forKey: .deletedAt)
+        self.expiresAt = try container.decodeIfPresent(Date.self, forKey: .expiresAt)
+            ?? self.deletedAt.addingTimeInterval(Self.retention)
+        self.reason = try container.decodeIfPresent(Reason.self, forKey: .reason) ?? .deleted
+    }
+
+    /// How long these bytes stay recoverable, whether the file was deleted or replaced.
     public static let retentionDays = 30
     public static let retention = TimeInterval(retentionDays) * 24 * 60 * 60
 
@@ -329,15 +376,18 @@ public struct DeletionCopy: Codable, Sendable, Equatable {
     }
 }
 
-/// One deleted file as the web view sees it: the records of every destination that deleted it,
-/// aggregated. `relativePath` is the identity — each replica records the same logical deletion
-/// independently, moments apart.
+/// One recoverable version as the web view sees it: the records of every destination that let
+/// those bytes go, aggregated. `relativePath` is the identity — each replica records the same
+/// logical event independently, moments apart.
 public struct DeletionEntry: Codable, Identifiable, Sendable {
     public var relativePath: String
     public var sourcePath: String
     public var size: Int64
     public var sha256: String
     public var deletedAt: Date
+    /// Why these bytes left the mirror, taken from the earliest record: how the list labels the row
+    /// and whether the file is gone (`deleted`) or merely superseded (`replaced`).
+    public var reason: DeleteRecord.Reason
     /// The earliest expiry across copies: once any copy's window closes it may vanish from that replica.
     public var expiresAt: Date
     public var copies: [DeletionCopy]
@@ -351,15 +401,51 @@ public struct DeletionEntry: Codable, Identifiable, Sendable {
     public var id: String { relativePath }
 
     public init(relativePath: String, sourcePath: String, size: Int64, sha256: String,
-                deletedAt: Date, expiresAt: Date, copies: [DeletionCopy]) {
+                deletedAt: Date, expiresAt: Date, copies: [DeletionCopy],
+                reason: DeleteRecord.Reason = .deleted) {
         self.relativePath = relativePath
         self.sourcePath = sourcePath
         self.size = size
         self.sha256 = sha256
         self.deletedAt = deletedAt
+        self.reason = reason
         self.expiresAt = expiresAt
         self.copies = copies
         self.restorable = copies.contains(where: \.available)
+    }
+}
+
+/// One path the mirror wants but deliberately left untouched because its bytes did not match the
+/// live source and NeoDrop had no manifest entry authorizing replacement.
+///
+/// The digest is read only when this conflict list is opened. The replace action sends it back and
+/// the engine rechecks it before retaining and overwriting anything, so a changed share file is
+/// refused instead of replaced under a stale confirmation.
+public struct ForeignCopyEntry: Codable, Identifiable, Sendable {
+    public var relativePath: String
+    public var replicaID: UUID
+    public var replicaName: String
+    public var absolutePath: String
+    public var sourcePath: String?
+    public var size: Int64?
+    public var sha256: String?
+    public var replaceable: Bool
+    public var unavailableReason: String?
+
+    public var id: String { "\(replicaID.uuidString):\(relativePath)" }
+
+    public init(relativePath: String, replicaID: UUID, replicaName: String, absolutePath: String,
+                sourcePath: String?, size: Int64?, sha256: String?, replaceable: Bool,
+                unavailableReason: String? = nil) {
+        self.relativePath = relativePath
+        self.replicaID = replicaID
+        self.replicaName = replicaName
+        self.absolutePath = absolutePath
+        self.sourcePath = sourcePath
+        self.size = size
+        self.sha256 = sha256
+        self.replaceable = replaceable
+        self.unavailableReason = unavailableReason
     }
 }
 
@@ -494,6 +580,8 @@ public struct ReplicaReport: Sendable, Identifiable {
     /// Files NeoDrop did not write and will not replace. Something else is at a path the mirror
     /// wants, and it is left exactly as it is.
     public var foreign: Int
+    /// Previous versions kept for recovery because the sync replaced the bytes NeoDrop had written.
+    public var replaced: Int
     public var bytesWritten: Int64
     public var errors: [String]
 
@@ -510,6 +598,7 @@ public struct ReplicaReport: Sendable, Identifiable {
         failed: Int = 0,
         adopted: Int = 0,
         foreign: Int = 0,
+        replaced: Int = 0,
         bytesWritten: Int64 = 0,
         errors: [String] = []
     ) {
@@ -525,6 +614,7 @@ public struct ReplicaReport: Sendable, Identifiable {
         self.failed = failed
         self.adopted = adopted
         self.foreign = foreign
+        self.replaced = replaced
         self.bytesWritten = bytesWritten
         self.errors = errors
     }
@@ -556,6 +646,8 @@ public struct SyncSummary: Sendable {
     public var filesAdopted: Int { replicas.reduce(0) { $0 + $1.adopted } }
     /// Files left alone because they are not NeoDrop's to replace.
     public var foreignFiles: Int { replicas.reduce(0) { $0 + $1.foreign } }
+    /// Previous versions kept for recovery by this run, across replicas.
+    public var versionsKept: Int { replicas.reduce(0) { $0 + $1.replaced } }
     public var bytesWritten: Int64 { replicas.reduce(0) { $0 + $1.bytesWritten } }
     public var failures: Int { replicas.reduce(0) { $0 + $1.failed } }
 

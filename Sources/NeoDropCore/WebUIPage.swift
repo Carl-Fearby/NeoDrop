@@ -113,6 +113,20 @@ enum WebUIPage {
         .copies { white-space: nowrap; }
         .copies span { display: block; font-size: 11px; color: var(--muted); }
         .copies span.unavailable { opacity: 0.5; text-decoration: line-through; }
+        .toolbar { max-width: 720px; margin: 0 auto 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .search { min-width: 180px; flex: 1; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 7px 10px; }
+        .filters { display: flex; gap: 5px; }
+        button.filter.active { background: var(--text); border-color: var(--text); color: var(--bg); }
+        .count { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+        .section { max-width: 720px; margin: 22px auto 8px; font-size: 16px; }
+        .section-note { max-width: 720px; margin: 0 auto 10px; color: var(--muted); font-size: 12px; }
+        .conflict-row { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-top: 1px solid var(--line); }
+        .conflict-row .info { min-width: 0; flex: 1; }
+        .danger { background: #b42318; border-color: #b42318; color: #fff; }
+        .danger:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
+        .version-details { margin-top: 5px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+        .version-details summary { cursor: pointer; }
+        .version-details code { user-select: all; }
         .empty, .loading { padding: 34px 20px; text-align: center; color: var(--muted); }
         .empty .title { color: var(--text); font-weight: 600; margin-bottom: 4px; font-size: 14px; }
         .note { max-width: 720px; margin: 14px auto 0; color: var(--muted); font-size: 12px; }
@@ -125,8 +139,8 @@ enum WebUIPage {
         <body>
         <header>
           <div>
-            <h1>Deleted Files</h1>
-            <p class="subtitle">NeoDrop keeps a copy of every deleted file for \(retentionDays) days.</p>
+            <h1>Deleted Files &amp; Versions</h1>
+            <p class="subtitle">Deleted files and the previous version of a replaced file, kept for \(retentionDays) days.</p>
           </div>
           <div class="spacer"></div>
           <button id="refresh">Refresh</button>
@@ -134,19 +148,44 @@ enum WebUIPage {
 
         <div id="banner" class="banner hidden"></div>
 
+        <div class="toolbar" role="search">
+          <input id="search" class="search" type="search" placeholder="Search file or folder" aria-label="Search retained files and versions">
+          <div class="filters" role="group" aria-label="Filter by why the version was kept">
+            <button class="filter active" data-filter="all" aria-pressed="true">All</button>
+            <button class="filter" data-filter="deleted" aria-pressed="false">Deleted</button>
+            <button class="filter" data-filter="replaced" aria-pressed="false">Previous versions</button>
+          </div>
+        </div>
+        <div id="count" class="count" role="status" aria-live="polite"></div>
+
         <main>
           <div id="list" class="loading">Loading…</div>
         </main>
 
+        <h2 class="section">Files left on the share</h2>
+        <p class="section-note">NeoDrop never replaces these automatically. Review the exact path and bytes before choosing to put the source file there instead. The share copy is kept for recovery first.</p>
+        <main>
+          <div id="foreign-list" class="loading">Checking for conflicts…</div>
+        </main>
+
         <p class="note">
-          Restoring puts the file back in its original folder and it is mirrored again on the next sync.
-          Files disappear from this list \(retentionDays) days after they were deleted, when their copies are cleaned up.
+          Restoring puts the version back in its original folder and it is mirrored again on the next sync.
+          Putting back a version that was replaced needs the version it replaces to be on a destination
+          already, so the newer file is never lost — if it is not there yet, sync first.
+          Files disappear from this list \(retentionDays) days after they left the mirror, when their copies are cleaned up.
         </p>
 
         <script>
         var banner = document.getElementById('banner');
         var list = document.getElementById('list');
+        var foreignList = document.getElementById('foreign-list');
         var refresh = document.getElementById('refresh');
+        var search = document.getElementById('search');
+        var count = document.getElementById('count');
+        var filterButtons = Array.prototype.slice.call(document.querySelectorAll('[data-filter]'));
+        var allFiles = [];
+        var activeFilter = 'all';
+        var retentionDays = 30;
 
         function show(kind, message) {
           banner.className = 'banner ' + kind;
@@ -186,29 +225,50 @@ enum WebUIPage {
           return ofPath.split('/').pop();
         }
 
-        function render(payload) {
+        function render() {
           list.className = '';
           list.textContent = '';
-          if (!payload.files || payload.files.length === 0) {
+          var query = search.value.trim().toLocaleLowerCase();
+          var files = allFiles.filter(function (entry) {
+            var reasonMatches = activeFilter === 'all' || entry.reason === activeFilter;
+            var textMatches = !query || entry.relativePath.toLocaleLowerCase().indexOf(query) !== -1;
+            return reasonMatches && textMatches;
+          });
+          filterButtons.forEach(function (button) {
+            var filter = button.getAttribute('data-filter');
+            var matching = allFiles.filter(function (entry) {
+              return filter === 'all' || entry.reason === filter;
+            }).length;
+            var label = filter === 'replaced' ? 'Previous versions' : (filter === 'deleted' ? 'Deleted' : 'All');
+            button.textContent = label + ' (' + matching + ')';
+            button.classList.toggle('active', activeFilter === filter);
+            button.setAttribute('aria-pressed', activeFilter === filter ? 'true' : 'false');
+          });
+          count.textContent = files.length + ' of ' + allFiles.length + ' retained item(s)';
+          if (allFiles.length === 0 || files.length === 0) {
             var empty = document.createElement('div');
             empty.className = 'empty';
             var title = document.createElement('div');
             title.className = 'title';
-            title.textContent = 'Nothing deleted';
+            title.textContent = allFiles.length === 0 ? 'Nothing here' : 'No matching versions';
             var hint = document.createElement('div');
-            hint.textContent = 'Files you delete from a protected folder show up here for ' + payload.retentionDays + ' days.';
+            hint.textContent = allFiles.length === 0
+              ? 'Deleted files and the versions NeoDrop replaces appear here for ' + retentionDays + ' days.'
+              : 'Try a different name or choose another filter.';
             empty.appendChild(title);
             empty.appendChild(hint);
             list.appendChild(empty);
             return;
           }
-          payload.files.forEach(function (entry) {
+          files.forEach(function (entry) {
             var row = document.createElement('div');
             row.className = 'row';
 
+            var replaced = entry.reason === 'replaced';
+
             var icon = document.createElement('div');
             icon.className = 'icon';
-            icon.textContent = '\\u{1F5D1}';
+            icon.textContent = replaced ? '↺' : '🗑';
             row.appendChild(icon);
 
             var info = document.createElement('div');
@@ -220,9 +280,22 @@ enum WebUIPage {
             var metaEl = document.createElement('div');
             metaEl.className = 'meta';
             var where = parent(entry.relativePath);
-            metaEl.textContent = (where ? where + ' · ' : '') + bytes(entry.size) + ' · deleted ' + when(entry.deletedAt) + ' · expires ' + when(entry.expiresAt);
+            metaEl.textContent = (where ? where + ' · ' : '') + bytes(entry.size) + ' · ' + (replaced ? 'replaced ' : 'deleted ') + when(entry.deletedAt) + ' · expires ' + when(entry.expiresAt);
+            var details = document.createElement('details');
+            details.className = 'version-details';
+            var summary = document.createElement('summary');
+            summary.textContent = 'Version details';
+            details.appendChild(summary);
+            var digest = document.createElement('div');
+            digest.textContent = 'SHA-256: ' + entry.sha256;
+            digest.title = entry.sha256;
+            details.appendChild(digest);
+            var source = document.createElement('div');
+            source.textContent = 'Restores to: ' + entry.sourcePath;
+            details.appendChild(source);
             info.appendChild(nameEl);
             info.appendChild(metaEl);
+            info.appendChild(details);
             row.appendChild(info);
 
             var copies = document.createElement('div');
@@ -240,14 +313,19 @@ enum WebUIPage {
             button.textContent = 'Restore';
             button.disabled = !entry.restorable;
             if (!entry.restorable) { button.title = 'No destination is reachable right now'; }
-            button.addEventListener('click', function () { restore(entry.relativePath, button); });
+            else if (replaced) { button.title = 'Put this version back over the newer one'; }
+            button.addEventListener('click', function () { restore(entry, button); });
             row.appendChild(button);
 
             list.appendChild(row);
           });
         }
 
-        function restore(relativePath, button) {
+        function restore(entry, button) {
+          var relativePath = entry.relativePath;
+          if (entry.reason === 'replaced' && !window.confirm(
+            'Restore the previous version of ' + relativePath + '?\n\nThis replaces the current version in the source folder. NeoDrop checks that the current version is already on a mounted destination before continuing.'
+          )) { return; }
           button.disabled = true;
           button.textContent = 'Restoring…';
           hide();
@@ -270,20 +348,120 @@ enum WebUIPage {
           });
         }
 
+        function renderForeign(files) {
+          foreignList.className = '';
+          foreignList.textContent = '';
+          if (!files.length) {
+            var empty = document.createElement('div');
+            empty.className = 'empty';
+            empty.textContent = 'No unresolved files on the shares.';
+            foreignList.appendChild(empty);
+            return;
+          }
+          files.forEach(function (entry) {
+            var row = document.createElement('div');
+            row.className = 'conflict-row';
+            var info = document.createElement('div');
+            info.className = 'info';
+            var title = document.createElement('div');
+            title.className = 'name';
+            title.textContent = entry.relativePath;
+            title.title = entry.absolutePath;
+            var source = document.createElement('div');
+            source.className = 'meta';
+            source.textContent = entry.replicaName + ' · ' + (entry.sourcePath ? 'source: ' + entry.sourcePath : 'no matching source path');
+            var theirs = document.createElement('div');
+            theirs.className = 'meta';
+            theirs.textContent = bytes(entry.size) + ' on share · SHA-256 ' + (entry.sha256 || 'unavailable');
+            info.appendChild(title);
+            info.appendChild(source);
+            info.appendChild(theirs);
+            row.appendChild(info);
+            var button = document.createElement('button');
+            button.className = 'danger';
+            button.textContent = 'Replace with source…';
+            button.disabled = !entry.replaceable;
+            if (!entry.replaceable) { button.title = entry.unavailableReason || 'This conflict cannot be replaced right now'; }
+            button.addEventListener('click', function () { replaceForeign(entry, button); });
+            row.appendChild(button);
+            foreignList.appendChild(row);
+          });
+        }
+
+        function replaceForeign(entry, button) {
+          if (!entry.replaceable || !entry.sha256) { return; }
+          var answer = window.confirm(
+            'Replace the file on ' + entry.replicaName + '?\\n\\n' + entry.relativePath + '\\n\\n' +
+            'The share currently has ' + bytes(entry.size) + ' (SHA-256 ' + entry.sha256 + ').\\n' +
+            'The source file will replace it. NeoDrop first keeps the share copy for ' + retentionDays + ' days in Deleted Files & Versions.'
+          );
+          if (!answer) { return; }
+          button.disabled = true;
+          button.textContent = 'Keeping copy…';
+          fetch('api/foreign/replace', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              relativePath: entry.relativePath,
+              replicaID: entry.replicaID,
+              expectedSHA256: entry.sha256
+            })
+          }).then(function (response) {
+            return response.json().catch(function () { return {}; }).then(function (body) {
+              if (!response.ok) { throw new Error(body.error || ('Replace failed (' + response.status + ')')); }
+              return body;
+            });
+          }).then(function () {
+            show('good', 'Replaced ' + entry.relativePath + '; the share’s previous bytes are retained for recovery.');
+            loadForeign();
+            load();
+          }).catch(function (error) {
+            show('warn', error.message);
+            button.disabled = false;
+            button.textContent = 'Replace with source…';
+          });
+        }
+
+        function loadForeign() {
+          foreignList.className = 'loading';
+          foreignList.textContent = 'Checking for conflicts…';
+          fetch('api/foreign').then(function (response) {
+            if (!response.ok) { throw new Error('The conflict list could not be read (' + response.status + ')'); }
+            return response.json();
+          }).then(function (payload) {
+            renderForeign(payload.files || []);
+          }).catch(function (error) {
+            foreignList.className = 'empty';
+            foreignList.textContent = error.message;
+          });
+        }
+
         function load() {
           list.className = 'loading';
           list.textContent = 'Loading…';
           fetch('api/deletions').then(function (response) {
             if (!response.ok) { throw new Error('The deletion list could not be read (' + response.status + ')'); }
             return response.json();
-          }).then(render).catch(function (error) {
+          }).then(function (payload) {
+            allFiles = payload.files || [];
+            retentionDays = payload.retentionDays || 30;
+            render();
+          }).catch(function (error) {
             list.className = 'empty';
             list.textContent = error.message;
           });
         }
 
-        refresh.addEventListener('click', load);
+        filterButtons.forEach(function (button) {
+          button.addEventListener('click', function () {
+            activeFilter = button.getAttribute('data-filter');
+            render();
+          });
+        });
+        search.addEventListener('input', render);
+        refresh.addEventListener('click', function () { load(); loadForeign(); });
         load();
+        loadForeign();
         </script>
         </body>
         </html>

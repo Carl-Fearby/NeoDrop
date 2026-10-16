@@ -138,6 +138,27 @@ final class FileStatusTests: XCTestCase {
                        "a retained copy explains where the bytes are: \(report.summary)")
     }
 
+    /// The same record answers for an overwritten version, and the report has to say which of the
+    /// two it is: a deleted file is gone until it is restored, a replaced one is right here.
+    func testAReplacedVersionIsAnsweredFromTheRetainedCopy() async throws {
+        try sandbox.write("first draft", to: "docs/alpha.txt")
+        let engine = sandbox.engine()
+        _ = await engine.sync(config: sandbox.config())
+        try sandbox.write("second draft", to: "docs/alpha.txt")
+        _ = await engine.sync(config: sandbox.config())
+
+        let report = query().report(for: sandbox.sourceFile("docs/alpha.txt"))
+        let retained = try XCTUnwrap(location(report, .retainedCopy, name: "NAS1"))
+
+        XCTAssertEqual(report.kind, "file", "the newest version is right here on this Mac")
+        XCTAssertTrue(retained.present)
+        XCTAssertEqual(retained.recorded?.kind, "previous version")
+        XCTAssertTrue(retained.note.contains("Replaced on"), retained.note)
+        XCTAssertTrue(retained.note.contains("recoverable until"), retained.note)
+        XCTAssertFalse(retained.note.contains("Deleted on"),
+                       "an overwritten version is not described as deleted: \(retained.note)")
+    }
+
     /// Someone editing or removing a file on the share by hand: NeoDrop's record says it wrote the
     /// file, the share says otherwise, and the report has to admit that rather than count a copy.
     func testACopyRemovedFromTheShareIsNotCountedAsACopy() async throws {

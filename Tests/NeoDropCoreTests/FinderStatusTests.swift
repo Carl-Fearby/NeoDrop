@@ -281,6 +281,22 @@ final class FinderStatusTests: XCTestCase {
                        "the trash directory is marked once, not once per retained file")
     }
 
+    /// A version kept because a copy replaced it lives in the same place as a deletion, so it gets
+    /// the same badge — and the file itself goes back to plain "in sync", because it is.
+    func testAReplacedVersionMarksTheHeldCopyWhereItLives() async throws {
+        try sandbox.write("first draft", to: "docs/alpha.txt")
+        let engine = sandbox.engine()
+        _ = await engine.sync(config: sandbox.config())
+        try sandbox.write("second draft", to: "docs/alpha.txt")
+        _ = await engine.sync(config: sandbox.config())
+
+        let index = build()
+        let trash = sandbox.trashURL(0, "docs/alpha.txt")
+        XCTAssertEqual(index.badge(for: trash.path), .held, "the kept version is findable where it is kept")
+        XCTAssertEqual(index.badge(for: sandbox.sourceFile("docs/alpha.txt").path), .synced,
+                       "and the live file is in sync, because its newest version is everywhere")
+    }
+
     func testTheFileBeingWorkedOnRightNowIsMarkedWorking() async throws {
         try sandbox.write("alpha", to: "alpha.txt")
         var progress = SyncProgress(phase: .syncing)

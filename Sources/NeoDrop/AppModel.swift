@@ -148,6 +148,16 @@ final class AppModel: ObservableObject {
                 guard let self else { throw NeoDropError.retainedCopyUnavailable(relativePath) }
                 return try await self.restoreDeletion(relativePath)
             },
+            foreignList: { [weak self] in
+                guard let self else { return [] }
+                return await self.foreignCopyEntries()
+            },
+            replaceForeign: { [weak self] relativePath, replicaID, expectedSHA256 in
+                guard let self else { throw NeoDropError.foreignCopyUnavailable(relativePath) }
+                return try await self.replaceForeignCopy(
+                    relativePath, replicaID: replicaID, expectedSHA256: expectedSHA256
+                )
+            },
             status: { [weak self] path in
                 await self?.fileStatus(path: path)
             }
@@ -190,6 +200,26 @@ final class AppModel: ObservableObject {
 
     func refreshDeletionCount() async {
         deletionCount = await deletionEntries().count
+    }
+
+    func foreignCopyEntries() async -> [ForeignCopyEntry] {
+        await engine.listForeignCopies(config: config)
+    }
+
+    /// The user's explicit answer to a conflict on one replica. The engine verifies that the
+    /// share still holds the bytes shown in the UI, keeps them for recovery, then copies the live
+    /// source version in. A normal sync follows to bring every other destination up to date.
+    func replaceForeignCopy(_ relativePath: String, replicaID: UUID, expectedSHA256: String) async throws -> URL {
+        let destination = try await engine.replaceForeignCopy(
+            relativePath: relativePath,
+            replicaID: replicaID,
+            expectedForeignSHA256: expectedSHA256,
+            config: config
+        )
+        NeoDropLog.shared.write("Replaced foreign copy \(relativePath) on \(config.replica(id: replicaID)?.displayName ?? "destination") after retaining its bytes", level: .success)
+        banner = "Replaced the share's copy. Its previous bytes are available in Deleted Files & Versions."
+        syncNow(reason: "after resolving \(destination.lastPathComponent)")
+        return destination
     }
 
     /// Restore one deletion at the user's request from the web view.
@@ -698,6 +728,11 @@ final class AppModel: ObservableObject {
         }
         if result.foreignFiles > 0 {
             line += ", \(result.foreignFiles) left alone (not written by NeoDrop)"
+        }
+        // Not unusual enough to warn about — a file was edited and the previous version is still
+        // recoverable — but naming it is what tells the user where an overwritten edit went.
+        if result.versionsKept > 0 {
+            line += ", \(result.versionsKept) previous version(s) kept for recovery"
         }
         NeoDropLog.shared.write(line, level: level)
         for failure in failures.prefix(5) {

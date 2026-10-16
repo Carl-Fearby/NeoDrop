@@ -208,6 +208,32 @@ public actor MirrorEngine {
                         continue
                     }
                     let destination = replica.url.appendingPathComponent(relativePath)
+                    // Repair overwrites the bad copy too. It might be a damaged transfer, or it
+                    // might be an edit made on the share; either way these are bytes that would
+                    // otherwise exist nowhere after repair, so retain them before writing. A
+                    // directory is not a repair candidate: it may hold someone's files.
+                    let retention: Retention
+                    if FileManager.default.fileExists(atPath: destination.path) {
+                        retention = retainOverwrittenBytes(
+                            relativePath: relativePath, replica: replica, config: config
+                        )
+                    } else {
+                        retention = .nothingToKeep
+                    }
+                    switch retention {
+                    case .notNeoDropsCopy:
+                        report.failed += 1
+                        report.errors.append("\(relativePath): a folder is sitting where this file belongs on \(replica.displayName) — it was left alone during repair.")
+                        continue
+                    case .failed(let why):
+                        report.failed += 1
+                        report.errors.append("\(relativePath): could not keep the replaced bytes for recovery (\(why)) — repair was not written.")
+                        continue
+                    case .kept:
+                        report.replaced += 1
+                    case .nothingToKeep:
+                        break
+                    }
                     do {
                         try copy(origin, to: destination, config: config)
                         manifest.entries[relativePath]?.writtenAt = Date()
@@ -421,8 +447,11 @@ public actor MirrorEngine {
             // The size is read first because it costs nothing: only a same-size candidate is worth
             // hashing, and a directory sitting where a file belongs (a size, but not a file's) is
             // somebody else's too.
-            if manifest.entries[relativePath] == nil, let sizeOnReplica, !FileMeta.isDirectory(destination) {
-                if sizeOnReplica == file.size,
+            if manifest.entries[relativePath] == nil,
+               FileManager.default.fileExists(atPath: destination.path) {
+                if !FileMeta.isDirectory(destination),
+                   let sizeOnReplica,
+                   sizeOnReplica == file.size,
                    let digest = try? Hashing.sha256(ofFileAt: destination), digest == file.sha256 {
                     manifest.entries[relativePath] = ManifestEntry(
                         size: file.size,
@@ -435,26 +464,81 @@ public actor MirrorEngine {
                     doneBytes += file.size
                     continue
                 }
+                // This includes directories: they are not adoptable, but the user should still
+                // see that the path is blocked, and automatic sync must never replace its tree.
                 foreign.append(relativePath)
                 report.foreign += 1
                 doneBytes += file.size
                 continue
             }
 
-            let isUpdate = manifest.entries[relativePath] != nil
-            do {
-                try copy(file.url, to: destination, config: config)
+            // A previous run may have written these exact source bytes, then crashed or failed to
+            // save its manifest. They are already the wanted version, not a hand edit to preserve:
+            // verify the digest, reconcile the manifest and move on without rewriting or refusing.
+            // This also covers a user who has independently put the exact source bytes on the share.
+            if manifest.entries[relativePath] != nil,
+               sizeOnReplica == file.size,
+               let digestOnReplica = try? Hashing.sha256(ofFileAt: destination),
+               digestOnReplica == file.sha256 {
                 manifest.entries[relativePath] = ManifestEntry(
                     size: file.size,
                     mtime: file.mtime,
                     sha256: file.sha256,
+                    verifiedAt: Date(),
                     sourceID: file.sourceID
                 )
-                if isUpdate { report.updated += 1 } else { report.copied += 1 }
-                report.bytesWritten += file.size
-            } catch {
+                report.upToDate += 1
+                doneBytes += file.size
+                continue
+            }
+
+            let isUpdate = manifest.entries[relativePath] != nil
+            // A replacement is the second way a version leaves the mirror, and the only one where
+            // NeoDrop is about to write over bytes it put on the share itself. Keep them first —
+            // the same retention a deletion gets — or refuse the copy. The alternative is an edit
+            // that afterwards exists nowhere, which is the one outcome a mirror must never produce
+            // quietly.
+            var retention = Retention.nothingToKeep
+            if let entry = manifest.entries[relativePath] {
+                retention = retainReplacedVersion(
+                    relativePath: relativePath, replica: replica, entry: entry, config: config
+                )
+                if retention == .kept { report.replaced += 1 }
+            }
+
+            switch retention {
+            case .notNeoDropsCopy:
+                // The path is NeoDrop's, but what is at it is not the bytes NeoDrop recorded: an
+                // edit made straight on the share, an upload that stopped halfway, or a folder
+                // where the file belongs. They exist nowhere else, so they are left alone and
+                // named — overwriting here is how the mirror would eat an edit it never saw.
                 report.failed += 1
-                report.errors.append("\(relativePath): \(error.localizedDescription)")
+                let what = FileMeta.isDirectory(destination)
+                    ? "a folder is sitting where this file belongs"
+                    : "the copy is not the version NeoDrop wrote (changed on the share, or partial)"
+                report.errors.append(
+                    "\(relativePath): \(what) on \(replica.displayName) — it was left alone, so the source version was not mirrored there."
+                )
+            case .failed(let why):
+                report.failed += 1
+                report.errors.append(
+                    "\(relativePath): could not keep the previous version for recovery (\(why)) — the copy on \(replica.displayName) was left as it is."
+                )
+            case .nothingToKeep, .kept:
+                do {
+                    try copy(file.url, to: destination, config: config)
+                    manifest.entries[relativePath] = ManifestEntry(
+                        size: file.size,
+                        mtime: file.mtime,
+                        sha256: file.sha256,
+                        sourceID: file.sourceID
+                    )
+                    if isUpdate { report.updated += 1 } else { report.copied += 1 }
+                    report.bytesWritten += file.size
+                } catch {
+                    report.failed += 1
+                    report.errors.append("\(relativePath): \(error.localizedDescription)")
+                }
             }
 
             doneBytes += file.size
@@ -488,6 +572,168 @@ public actor MirrorEngine {
         report.errors.append(contentsOf: plan.errors)
         report.status = report.failed > 0 || !report.errors.isEmpty ? .degraded : .online
         return report
+    }
+
+    /// List the recorded foreign paths, including offline or otherwise unreplaceable conflicts.
+    /// Hashing is bounded to just the conflicts the user opened, not the whole mirror. The hash is
+    /// returned for optimistic concurrency: replace refuses if those exact bytes have since changed.
+    public func listForeignCopies(config: AppConfig) -> [ForeignCopyEntry] {
+        config.replicas.flatMap { replica -> [ForeignCopyEntry] in
+            let manifest = manifestStore.load(replicaID: replica.id)
+            return manifest.foreignPaths.sorted().map { relativePath in
+                let url = replica.url.appendingPathComponent(relativePath)
+                let available = replica.enabled && Self.isUsableDirectory(replica.url)
+                let isFile = available && FileManager.default.fileExists(atPath: url.path)
+                    && !FileMeta.isDirectory(url)
+                let source = Self.sourceFile(forMirroredPath: relativePath, config: config)
+                let sourceAvailable = source.map {
+                    Self.isUsableDirectory($0.root.url)
+                        && FileManager.default.fileExists(atPath: $0.file.path)
+                        && !FileMeta.isDirectory($0.file)
+                } ?? false
+                let size = isFile ? FileMeta.size(ofFileAt: url) : nil
+                let digest = isFile ? try? Hashing.sha256(ofFileAt: url) : nil
+                let replaceable = isFile && digest != nil && sourceAvailable
+                let reason: String?
+                if !available { reason = "Destination is offline or disabled" }
+                else if !isFile { reason = "The conflict is no longer a regular file on the share" }
+                else if digest == nil { reason = "The file on the share could not be read" }
+                else if !sourceAvailable { reason = "The corresponding source file is unavailable" }
+                else { reason = nil }
+                return ForeignCopyEntry(
+                    relativePath: relativePath,
+                    replicaID: replica.id,
+                    replicaName: replica.displayName,
+                    absolutePath: url.path,
+                    sourcePath: source?.file.path,
+                    size: size,
+                    sha256: digest,
+                    replaceable: replaceable,
+                    unavailableReason: reason
+                )
+            }
+        }
+    }
+
+    /// Explicitly replace a foreign file on one replica with the live source's bytes.
+    ///
+    /// This is the deliberate, in-app counterpart to the sync rule that never replaces foreign
+    /// data automatically. It is scoped to a single configured enabled replica and requires all
+    /// of the following before it acts:
+    ///
+    /// * the path is valid, is a regular file, and is currently listed in that replica's
+    ///   `foreignPaths`;
+    /// * the destination is currently a regular file whose digest still matches the digest NeoDrop
+    ///   showed in the confirmation UI, so a file changed after the user saw the dialog is refused;
+    /// * the source still exists, and its digest is computed at action time;
+    /// * the share copy and its `.replaced` recovery record are safely retained before replacement.
+    ///
+    /// Directories and untracked path conflicts are not eligible. A successful operation updates
+    /// that replica's manifest and removes its foreign badge; the caller starts a normal sync so
+    /// the other replicas receive the source bytes as usual.
+    public func replaceForeignCopy(
+        relativePath: String,
+        replicaID: UUID,
+        expectedForeignSHA256: String,
+        config: AppConfig
+    ) throws -> URL {
+        guard Self.isSafeRelativePath(relativePath),
+              expectedForeignSHA256.count == 64,
+              expectedForeignSHA256.allSatisfy({ $0.isHexDigit }),
+              let replica = config.enabledReplicas.first(where: { $0.id == replicaID }),
+              Self.isUsableDirectory(replica.url) else {
+            throw NeoDropError.foreignCopyUnavailable(relativePath)
+        }
+        var manifest = manifestStore.load(replicaID: replica.id)
+        guard manifest.foreignPaths.contains(relativePath) else {
+            throw NeoDropError.foreignCopyChanged(relativePath)
+        }
+
+        let destination = replica.url.appendingPathComponent(relativePath)
+        guard FileManager.default.fileExists(atPath: destination.path),
+              !FileMeta.isDirectory(destination),
+              let digest = try? Hashing.sha256(ofFileAt: destination),
+              digest == expectedForeignSHA256 else {
+            throw NeoDropError.foreignCopyChanged(relativePath)
+        }
+        guard let source = Self.sourceFile(forMirroredPath: relativePath, config: config),
+              Self.isUsableDirectory(source.root.url),
+              FileManager.default.fileExists(atPath: source.file.path),
+              !FileMeta.isDirectory(source.file) else {
+            throw NeoDropError.restoreSourceUnavailable(relativePath)
+        }
+        guard let sourceDigest = try? Hashing.sha256(ofFileAt: source.file),
+              let sourceSize = FileMeta.size(ofFileAt: source.file) else {
+            throw NeoDropError.restoreSourceUnavailable(source.file.path)
+        }
+        let sourceMtime = FileMeta.modificationDate(ofFileAt: source.file) ?? Date()
+
+        let previousRecord = DeleteStore(paths: paths).load(replicaID: replica.id)
+            .first { $0.relativePath == relativePath }
+        switch retainOverwrittenBytes(relativePath: relativePath, replica: replica, config: config) {
+        case .kept:
+            // A second digest check catches an edit racing the first check. Its bytes are safe in
+            // retention, but this request was confirmed against a different file, so do not write
+            // the source over it on a stale confirmation. Roll back only the record written by
+            // this call; preserve an older record if the move failed partway through.
+            let records = DeleteStore(paths: paths).load(replicaID: replica.id)
+            guard records.first(where: { $0.relativePath == relativePath })?.sha256 == expectedForeignSHA256 else {
+                var restoredRecords = records.filter { $0.relativePath != relativePath }
+                if let previousRecord { restoredRecords.append(previousRecord) }
+                try? DeleteStore(paths: paths).save(restoredRecords, for: replica.id)
+                throw NeoDropError.foreignCopyChanged(relativePath)
+            }
+        case .notNeoDropsCopy:
+            throw NeoDropError.foreignCopyChanged(relativePath)
+        case .nothingToKeep:
+            throw NeoDropError.foreignCopyUnavailable(relativePath)
+        case .failed(let reason):
+            throw NeoDropError.foreignCopyRetentionFailed(relativePath, reason)
+        }
+
+        // Copy only after the bytes on the share are in the recoverable store. If the copy fails,
+        // the old share bytes remain available in the recovery list, and no tracking record claims
+        // that the new bytes have landed.
+        do {
+            try copy(source.file, to: destination, config: config)
+        } catch {
+            throw error
+        }
+        manifest.entries[relativePath] = ManifestEntry(
+            size: sourceSize,
+            mtime: sourceMtime,
+            sha256: sourceDigest,
+            sourceID: source.root.id
+        )
+        manifest.foreignPaths.removeAll { $0 == relativePath }
+        manifest.lastSync = Date()
+        try manifestStore.save(manifest)
+        return destination
+    }
+
+    /// A mirrored path is data, never a path traversal command from an HTTP request or JSON record.
+    private static func isSafeRelativePath(_ path: String) -> Bool {
+        guard !path.isEmpty, !path.hasPrefix("/"), !path.contains("\\") else { return false }
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false)
+        return !parts.isEmpty && parts.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+    }
+
+    /// Resolve a mirrored path to the one source file it represents. Multi-source mirrors are
+    /// namespaced by display name, matching `buildSourcePlan` exactly.
+    private static func sourceFile(forMirroredPath path: String, config: AppConfig) -> (root: SourceRoot, file: URL)? {
+        guard !config.sources.isEmpty, isSafeRelativePath(path) else { return nil }
+        if config.sources.count == 1 {
+            let root = config.sources[0]
+            return (root, root.url.appendingPathComponent(path))
+        }
+        for root in config.sources {
+            let prefix = root.displayName + "/"
+            guard path.hasPrefix(prefix) else { continue }
+            let suffix = String(path.dropFirst(prefix.count))
+            guard !suffix.isEmpty else { return nil }
+            return (root, root.url.appendingPathComponent(suffix))
+        }
+        return nil
     }
 
     /// Guards the one operation that can destroy data: removing many files in a single run.
@@ -549,6 +795,113 @@ public actor MirrorEngine {
                 throw NeoDropError.verificationFailed(destination.path)
             }
         }
+    }
+
+    // MARK: - Keeping the version a copy is about to replace
+
+    /// What happened when the sync tried to keep the version it is about to overwrite.
+    private enum Retention: Equatable {
+        /// Nothing is there to keep: nothing exists at the path, so the copy is a clean create.
+        case nothingToKeep
+        /// The previous version is in the trash, recorded, and the new bytes may be written.
+        case kept
+        /// What is at the path is not the version NeoDrop recorded: different bytes (an edit on the
+        /// share, a partial upload) or not a file at all.
+        case notNeoDropsCopy
+        /// The previous version could not be kept, so nothing was written over it.
+        case failed(String)
+    }
+
+    /// In a regular sync, move the copy that is about to be replaced into the replica's trash and
+    /// record it, so an overwritten edit stays recoverable for the retention window instead of
+    /// existing nowhere afterwards. Only bytes matching the manifest are eligible: an edit made
+    /// straight on the share, or an interrupted upload, is left alone rather than overwritten.
+    /// Verify & Repair has its own path below: it may keep mismatching bytes, since repair is the
+    /// explicit instruction to replace a bad copy.
+    private func retainReplacedVersion(
+        relativePath: String,
+        replica: Replica,
+        entry: ManifestEntry,
+        config: AppConfig
+    ) -> Retention {
+        let destination = replica.url.appendingPathComponent(relativePath)
+        guard let size = FileMeta.size(ofFileAt: destination),
+              let digest = try? Hashing.sha256(ofFileAt: destination),
+              size == entry.size, digest == entry.sha256 else {
+            return FileManager.default.fileExists(atPath: destination.path)
+                ? .notNeoDropsCopy
+                : .nothingToKeep
+        }
+        return retainBytes(relativePath: relativePath, replica: replica, size: size,
+                           digest: digest, config: config)
+    }
+
+    /// Verify & Repair is explicitly allowed to replace a copy that no longer matches the
+    /// manifest. That copy may be a partial transfer or somebody's edit on the share; keep its
+    /// actual bytes and digest before repair, so the chosen repair source cannot make them vanish.
+    private func retainOverwrittenBytes(
+        relativePath: String,
+        replica: Replica,
+        config: AppConfig
+    ) -> Retention {
+        let destination = replica.url.appendingPathComponent(relativePath)
+        guard !FileMeta.isDirectory(destination) else { return .notNeoDropsCopy }
+        guard let size = FileMeta.size(ofFileAt: destination),
+              let digest = try? Hashing.sha256(ofFileAt: destination) else {
+            return .failed("the existing copy could not be read and hashed")
+        }
+        return retainBytes(relativePath: relativePath, replica: replica, size: size,
+                           digest: digest, config: config)
+    }
+
+    /// Persist and move actual replica bytes into retention after their digest has been verified.
+    private func retainBytes(
+        relativePath: String,
+        replica: Replica,
+        size: Int64,
+        digest: String,
+        config: AppConfig
+    ) -> Retention {
+        let fm = FileManager.default
+        let destination = replica.url.appendingPathComponent(relativePath)
+        guard !FileMeta.isDirectory(destination), fm.fileExists(atPath: destination.path) else {
+            return .failed("the copy that was about to be retained is no longer a regular file")
+        }
+        let store = DeleteStore(paths: paths)
+        var records = store.load(replicaID: replica.id)
+        // One version per path: a newer retention supersedes the previous one for the same file.
+        records.removeAll { $0.relativePath == relativePath }
+        let trashURL = DeleteRecord(relativePath: relativePath, sourcePath: "", size: 0, sha256: "")
+            .trashURL(onReplicaRoot: replica.url)
+        guard Self.isInside(trashURL, of: trashRoot(replica.url)) else {
+            return .failed("the path for its retained copy is outside the replica")
+        }
+        records.append(DeleteRecord(
+            relativePath: relativePath,
+            sourcePath: Self.sourcePath(forMirroredPath: relativePath, config: config),
+            size: size,
+            sha256: digest,
+            reason: .replaced
+        ))
+        do {
+            try store.save(records, for: replica.id)
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+        do {
+            try fm.createDirectory(at: trashURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if fm.fileExists(atPath: trashURL.path) {
+                try fm.removeItem(at: trashURL)
+            }
+            // One rename inside the share: the bytes never travel.
+            try fm.moveItem(at: destination, to: trashURL)
+        } catch {
+            // Never leave a record claiming bytes that are not in the trash.
+            records.removeAll { $0.relativePath == relativePath }
+            try? store.save(records, for: replica.id)
+            return .failed(error.localizedDescription)
+        }
+        return .kept
     }
 
     // MARK: - Source planning
@@ -683,18 +1036,28 @@ public actor MirrorEngine {
             }
         }
 
-        return recordsByPath.compactMap { relativePath, records in
+        // Written out one value at a time on purpose: as a single expression this closure is more
+        // than the type checker will accept in reasonable time.
+        return recordsByPath.compactMap { relativePath, records -> DeletionEntry? in
             guard let earliest = records.min(by: { $0.deletedAt < $1.deletedAt }) else { return nil }
+            let sourcePath: String = records.first(where: { !$0.sourcePath.isEmpty })?.sourcePath
+                ?? earliest.sourcePath
+            // The entry is only as safe as its weakest copy: the window closes for all of them at
+            // the first expiry, because that is when any of them may be purged.
+            let expiresAt: Date = records.map(\.expiresAt).min() ?? earliest.expiresAt
+            let copies: [DeletionCopy] = (copiesByPath[relativePath] ?? [])
+                .sorted { $0.replicaName < $1.replicaName }
             return DeletionEntry(
                 relativePath: relativePath,
-                sourcePath: records.first(where: { !$0.sourcePath.isEmpty })?.sourcePath ?? earliest.sourcePath,
+                sourcePath: sourcePath,
                 size: earliest.size,
                 sha256: earliest.sha256,
                 deletedAt: earliest.deletedAt,
-                // The entry is only as safe as its weakest copy: the window closes for all of
-                // them at the first expiry, because that is when any of them may be purged.
-                expiresAt: records.map(\.expiresAt).min() ?? earliest.expiresAt,
-                copies: (copiesByPath[relativePath] ?? []).sorted { $0.replicaName < $1.replicaName }
+                expiresAt: expiresAt,
+                copies: copies,
+                // What happened is the earliest record's story: the first replica to let the
+                // bytes go is the one that decided whether the file was deleted or replaced.
+                reason: earliest.reason
             )
         }
         // Newest first. Records are stored with second precision, so deletions in the same second
@@ -707,13 +1070,22 @@ public actor MirrorEngine {
         }
     }
 
-    /// Put a deleted file back where it came from, using the best verified retained copy.
+    /// Put a retained version back where it came from, using the best verified copy. Both kinds of
+    /// record come through here: a file that was deleted everywhere, and the version a newer one
+    /// replaced. Restoring either is the same operation — a verified copy goes back to the source
+    /// path the record names — so they share every rule below and the same button.
     ///
     /// Safety rules, in the same spirit as the rest of the engine:
     ///
-    /// * Nothing is ever overwritten. If a file already sits at the destination, the restore
-    ///   only counts as done when that file is byte-identical — the deletion was already undone.
-    ///   Anything else is a conflict and the user's new file wins.
+    /// * A restore never guesses. Overwriting what is at the destination happens for one reason
+    ///   only: putting an earlier version back over the one that superseded it. Even then it needs
+    ///   the version it is about to write over to be verifiably on a mounted replica already
+    ///   (`newerVersionIsOnAReplica`) — otherwise the file at that path is the user's newest work,
+    ///   it exists nowhere else, and the restore is refused with the reason rather than done.
+    /// * Restoring a deleted file still refuses to overwrite anything: a file the user put at that
+    ///   path is newer than the deletion, and only the user undoes a deletion.
+    /// * If the destination already holds the retained bytes, the restore counts as done and the
+    ///   retained copies are handed back.
     /// * The retained bytes are verified against the digest in the record before the source
     ///   folder is touched, and the written copy is verified again after it lands.
     /// * The destination is validated against the configured source roots, so a record that was
@@ -750,7 +1122,24 @@ public actor MirrorEngine {
                 discardRetainedCopies(relativePath: relativePath, config: config)
                 return target.destination
             }
-            throw NeoDropError.restoreConflict(target.destination.path)
+            // A file is at the destination and it is not the version being restored.
+            guard primary.reason == .replaced else {
+                // A deletion: the file there is newer than the deletion, and undoing a deletion is
+                // the user's call, not a side effect of pressing Restore.
+                throw NeoDropError.restoreConflict(target.destination.path)
+            }
+            // A replacement: putting the earlier version back is exactly what was asked for, so
+            // the newer file is overwritten — but only when it is provably on a mounted replica
+            // already. Otherwise these are the user's newest bytes, on this Mac alone, and they
+            // would be gone: the version being restored is still safely in the trash, so refusing
+            // costs nothing that cannot be retried after a sync.
+            guard newerVersionIsOnAReplica(
+                relativePath: relativePath,
+                fileAt: target.destination,
+                config: config
+            ) else {
+                throw NeoDropError.restoreWouldLoseNewerWork(target.destination.path)
+            }
         }
 
         var lastError: Error = NeoDropError.retainedCopyUnavailable(relativePath)
@@ -790,6 +1179,27 @@ public actor MirrorEngine {
 
         discardRetainedCopies(relativePath: relativePath, config: config)
         return target.destination
+    }
+
+    /// Is the version standing at `fileAt` verifiably on a mounted replica?
+    ///
+    /// This is the question a restore of a replaced version has to answer before it writes over
+    /// the newer file. A digest match on a reachable replica means nothing is lost by putting the
+    /// earlier version back — the share still holds the newer bytes, and they can be mirrored back
+    /// whenever they are wanted. An unreachable replica is not an answer, for the same reason the
+    /// retention bookkeeping never assumes an unmounted share is empty: a copy that cannot be read
+    /// cannot be counted on.
+    private func newerVersionIsOnAReplica(relativePath: String, fileAt file: URL, config: AppConfig) -> Bool {
+        guard let size = FileMeta.size(ofFileAt: file),
+              let digest = try? Hashing.sha256(ofFileAt: file) else { return false }
+        for destination in Self.deleteDestinations(config: config) where destination.isAvailable {
+            let copy = destination.root.appendingPathComponent(relativePath)
+            guard FileMeta.size(ofFileAt: copy) == size,
+                  let digestOnReplica = try? Hashing.sha256(ofFileAt: copy),
+                  digestOnReplica == digest else { continue }
+            return true
+        }
+        return false
     }
 
     /// Hand back the space of deletions whose window has closed: bytes first, then the record.
@@ -1006,6 +1416,12 @@ public enum NeoDropError: Error, LocalizedError {
     case restoreConflict(String)
     case restoreSourceUnavailable(String)
     case retainedCopyUnavailable(String)
+    case foreignCopyUnavailable(String)
+    case foreignCopyChanged(String)
+    case foreignCopyRetentionFailed(String, String)
+    /// Restoring an earlier version was refused because the version it would write over is not on
+    /// any mounted replica yet, so putting the earlier one back would lose the newer one.
+    case restoreWouldLoseNewerWork(String)
 
     public var errorDescription: String? {
         switch self {
@@ -1021,6 +1437,14 @@ public enum NeoDropError: Error, LocalizedError {
             return "The original folder is no longer configured, so \(path) has nowhere to go"
         case .retainedCopyUnavailable(let path):
             return "No destination holds a verified retained copy of \(path)"
+        case .foreignCopyUnavailable(let path):
+            return "No eligible foreign file is available to replace at \(path)"
+        case .foreignCopyChanged(let path):
+            return "The file on the share changed since it was listed; nothing was replaced at \(path). Refresh and review it again"
+        case .foreignCopyRetentionFailed(let path, let reason):
+            return "Could not preserve the file on the share at \(path) (\(reason)); nothing was replaced"
+        case .restoreWouldLoseNewerWork(let path):
+            return "The version of \(path) on this Mac has not reached a mounted destination yet, so putting the previous version back would lose it — sync first, then restore again"
         }
     }
 }
