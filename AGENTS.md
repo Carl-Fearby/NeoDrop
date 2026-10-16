@@ -15,7 +15,7 @@ server and no cloud component.
 
 ```bash
 swift build                                        # compile everything
-swift test                                         # 248 engine tests, all green
+swift test                                         # 251 engine tests, all green
 swift run NeoDrop                                  # run the app (menu bar icon)
 swift build -c release --show-bin-path             # locate the release binary
 scripts/package.sh [--arch universal] [--no-dmg]   # .app + DMG, ad-hoc signed by default
@@ -36,6 +36,14 @@ scripts/setup-dmg-tools.sh                                    # one-off: .venv +
     --background build/dmg-background.png --layout build/dmg-layout.json \
     --badge-icon build/NeoDrop.icns --dump
 ```
+
+The version a build is named after comes from `--version`, else an exact tag on `HEAD`, else
+`packaging/VERSION` — one place to bump, and the same string in the DMG's file name, in Get Info and
+in the installer. It is never the commit hash: `git describe --always` put the hash in the file name
+and, through a `sed` that strips non-numerics, in `CFBundleShortVersionString` (the app once reported
+version "7.0", taken from a commit starting with `7a64245`). The hash is still recorded, in
+`CFBundleVersion` and `NeoDropBuildCommit`. A tree with uncommitted changes is named `…-dirty-…`,
+because two installers with one name have to be one build.
 
 ## Invariants — do not weaken these
 

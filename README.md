@@ -206,9 +206,17 @@ scripts/e2e-vault.sh                    # two real installs, one vault: edits bo
 scripts/install.sh                      # after building: into /Applications, Finder extension switched on
 ```
 
-Output: `build/NeoDrop.app` and `build/neodrop-<version>-macos-<arch>.dmg`. Drag-installing the DMG
-does the first half of what `install.sh` does; the second half — turning the Finder extension on — is
-done by hand in System Settings unless you run the script.
+Output: `build/NeoDrop.app` and `build/neodrop-<version>-macos-<arch>.dmg` — for this checkout,
+`build/neodrop-1.0.0-macos-arm64.dmg`. Drag-installing the DMG does the first half of what
+`install.sh` does; the second half — turning the Finder extension on — is done by hand in System
+Settings unless you run the script.
+
+The version in that name is one you chose, not a commit hash: `--version X.Y.Z` if you pass it,
+otherwise an exact git tag on `HEAD` (`v1.2.3`), otherwise `packaging/VERSION` — the one file to edit
+when you bump it, and the same value Finder shows in Get Info. A build from a tree with uncommitted
+changes is named `…-dirty-…`, so two installers with the same name are always the same build. The
+commit itself is still recorded, in `CFBundleVersion` and `NeoDropBuildCommit`, where something can
+go and read it instead of a file name.
 
 ### The drag-and-drop installer window
 
@@ -494,7 +502,8 @@ scripts/                 build, icon generation, packaging, verification, e2e, f
   reset.sh               the clean-install path: removes this Mac's state, never your data
   uninstall.sh           the other direction: the app, the Finder extension and the state, all gone
   setup-dmg-tools.sh     installs dmgbuild into .venv (optional, for the layout)
-packaging/               Info.plist and entitlements templates, for the app and the extension
+packaging/               Info.plist and entitlements templates for the app and the extension, and
+                         VERSION — the version the app and the installer are named after
 build/                   generated: NeoDrop.app, .icns, .dmg
 ```
 

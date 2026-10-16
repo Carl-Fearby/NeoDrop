@@ -8,6 +8,9 @@
 # Usage: scripts/package.sh [--arch arm64|x86_64|universal] [--skip-build] [--version X.Y.Z]
 #                           [--no-dmg] [--force]
 #
+# Version: --version if given, else an exact git tag on HEAD (v1.2.3), else packaging/VERSION. Never
+# the commit hash — that belongs in CFBundleVersion and NeoDropBuildCommit, not in a file name.
+#
 # --force  build even if a NeoDrop DMG is still mounted (see the stale-mount check below).
 #
 # Signing (env):
@@ -77,11 +80,31 @@ case "$ARCH" in
 esac
 
 # ---- version ----------------------------------------------------------------------------------
+# What a person reads: in the DMG's file name, in Finder's Get Info, on the installer's window. It
+# therefore comes from something a person set — --version, then an exact tag on HEAD, then
+# packaging/VERSION — and only then from a built-in default.
+#
+# It used to come from `git describe --tags --always --dirty`, which in a repository without tags is
+# the commit hash: the installer was called
+# neodrop-4a2ef93-dirty-macos-arm64.dmg, and CFBundleShortVersionString was the leading digit of
+# that hash ("7.0" — a version nobody chose and nobody can order). The hash is still recorded, in
+# NeoDropBuildCommit and CFBundleVersion, where it means exactly what it says.
 if [ -z "$VERSION" ]; then
-  if VERSION="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null)"; then
+  if VERSION="$(git -C "$ROOT" describe --tags --exact-match 2>/dev/null)" && [ -n "$VERSION" ]; then
     :
-  else
-    VERSION="0.1.0"
+  elif [ -f "$HERE/VERSION" ]; then
+    VERSION="$(tr -d '[:space:]' < "$HERE/VERSION")"
+  fi
+fi
+[ -n "$VERSION" ] || VERSION="1.0.0"
+
+# Two installers with the same name have to be the same build, so a tree with uncommitted changes is
+# named after that. Tracked changes only: build output is ignored, and an untracked file is not part
+# of the app unless it is compiled in by hand.
+DIRTY=""
+if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if ! git -C "$ROOT" diff --quiet || ! git -C "$ROOT" diff --cached --quiet; then
+    DIRTY="-dirty"
   fi
 fi
 # CFBundleShortVersionString has to be numeric X.Y.Z, whatever the tag looked like.
@@ -91,7 +114,7 @@ SHORT_VERSION="$(printf '%s' "$VERSION" | sed -E 's/^[vV]//; s/[^0-9.].*$//')"
 SHORT_VERSION="$(printf '%s' "$SHORT_VERSION" | cut -d. -f1-3)"
 BUILD_SHA="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
-echo "NeoDrop $VERSION ($SHORT_VERSION) · $ARCH_LABEL · ${BUILD_SHA}"
+echo "NeoDrop $VERSION$DIRTY ($SHORT_VERSION) · $ARCH_LABEL · ${BUILD_SHA}"
 
 # ---- build ------------------------------------------------------------------------------------
 if [ "$SKIP_BUILD" -eq 0 ]; then
@@ -307,7 +330,7 @@ if [ "$MAKE_DMG" -eq 1 ]; then
 
   # Lowercase by hand: macOS ships bash 3.2, which has no ${var,,} expansion.
   APP_SLUG="$(printf '%s' "$APP_NAME" | tr '[:upper:]' '[:lower:]')"
-  DMG="$BUILD/$APP_SLUG-$VERSION-macos-$ARCH_LABEL.dmg"
+  DMG="$BUILD/$APP_SLUG-$VERSION$DIRTY-macos-$ARCH_LABEL.dmg"
   rm -f "$DMG"
 
   # Both layouts need the first-launch instructions, so they are written once here.
