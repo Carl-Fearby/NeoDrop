@@ -159,8 +159,10 @@ def build(args, layout):
     except subprocess.CalledProcessError as error:
         return fail(f"could not set the volume icon: {error}")
     finally:
-        unmount(mount_point)
-        shutil.rmtree(mount_point, ignore_errors=True)
+        # Only remove the staging directory once the image is really gone: rmtree on a mount point
+        # that is still mounted does nothing, which is how the directory (and the mount) accumulated.
+        if unmount(mount_point):
+            shutil.rmtree(mount_point, ignore_errors=True)
 
     # Compress the finished filesystem. The .DS_Store, the background, the custom-icon bit and the
     # payload all carry across the conversion untouched.
@@ -231,7 +233,23 @@ def mount(image, mount_point):
 
 
 def unmount(mount_point):
-    subprocess.run(["hdiutil", "detach", mount_point], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Detach the image, and try harder when the volume is busy. Returns True when it let go.
+
+    A detach fails while anything still has the volume open, and Spotlight indexing an image the
+    script has just written does exactly that. The failure used to be thrown away, so the mount
+    outlived the run — and a leaked mount is not harmless: the next packaging run fails inside
+    `diskutil image create` with "Resource temporarily unavailable" (error 156) and nothing on
+    screen connects the two. So: retry with -force, and if it still will not let go, say which
+    volume is stuck and how to eject it, rather than leaving it for the next person to find.
+    """
+    for force in (False, True):
+        command = ["hdiutil", "detach", mount_point] + (["-force"] if force else [])
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 0 or not os.path.ismount(mount_point):
+            return True
+    fail(f"{mount_point} is still mounted: eject it before packaging again "
+         f"(diskutil eject \"{mount_point}\")")
+    return False
 
 
 def read_store(mount_point):
@@ -594,8 +612,8 @@ def verify(args, layout):
             else:
                 ok(f"{readme_name}'s icon and label clear the other two slots")
     finally:
-        unmount(mount_point)
-        shutil.rmtree(mount_point, ignore_errors=True)
+        if unmount(mount_point):
+            shutil.rmtree(mount_point, ignore_errors=True)
 
     if failures:
         print()

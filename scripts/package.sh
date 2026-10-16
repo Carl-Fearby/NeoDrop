@@ -314,6 +314,21 @@ if [ "$MAKE_DMG" -eq 1 ]; then
   # silently contains the previous build. Refuse rather than create that confusion.
   # Only mount points count: `hdiutil info` also lists the underlying device chain
   # (partition scheme, APFS container), which must never be handed to `diskutil eject`.
+  # A staging image from an interrupted run is mounted at a neodrop-rw-* (or, while verifying, a
+  # neodrop-dmg-*) directory under the temp folder. A leaked mount is not harmless: the *next*
+  # packaging run fails inside `diskutil image create` with "Resource temporarily unavailable"
+  # (error 156), with nothing on screen connecting the two, and the mounts accumulate. Nothing else
+  # mounts an image at a directory with that prefix, so they are ejected here rather than left to
+  # wedge the next build. make-dmg.py now detaches its own images, retrying with -force.
+  LEFTOVER_STAGING="$(mount | awk '$3 ~ /neodrop-(rw|dmg)-/ { print $3 }')"
+  if [ -n "$LEFTOVER_STAGING" ]; then
+    for volume in $LEFTOVER_STAGING; do
+      warn "ejecting a staging image an earlier run left mounted: $volume"
+      hdiutil detach "$volume" >/dev/null 2>&1 || diskutil eject "$volume" >/dev/null 2>&1 \
+        || warn "could not eject $volume"
+    done
+  fi
+
   MOUNTED_VOLUMES="$(hdiutil info 2>/dev/null | awk -v dir="$(cd "$BUILD" && pwd -P)" '
     /^image-path/ { current = $3 }
     /^\/dev\// && index(current, dir "/neodrop-") == 1 && $NF ~ /^\/Volumes\// { print $NF }
