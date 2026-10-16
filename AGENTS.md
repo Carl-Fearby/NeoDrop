@@ -19,6 +19,8 @@ swift test                                         # 251 engine tests, all green
 swift run NeoDrop                                  # run the app (menu bar icon)
 swift build -c release --show-bin-path             # locate the release binary
 scripts/package.sh [--arch universal] [--no-dmg]   # .app + DMG, ad-hoc signed by default
+MACOS_SIGN_IDENTITY="$(security find-identity -v -p codesigning | awk -F'\"' '/Apple Development/ {print $2; exit}')" \
+    scripts/package.sh && scripts/install.sh        # the same build, signed: Finder badges work
 scripts/verify.sh --smoke                          # bundle, signature, DMG and a real launch
 scripts/e2e.sh [--keep]                            # drive the packaged app against fake NAS folders
 scripts/e2e-vault.sh [--keep]                      # two real installs, one vault: both directions

@@ -433,6 +433,14 @@ nothing. Sign both bundles with one identity and it publishes:
 MACOS_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/package.sh && scripts/install.sh
 ```
 
+`security find-identity -v -p codesigning` prints that string for you — an identity's common name,
+with its team in brackets — so it does not have to be typed from memory:
+
+```bash
+MACOS_SIGN_IDENTITY="$(security find-identity -v -p codesigning | awk -F'\"' '/Apple Development/ {print $2; exit}')" \
+  scripts/package.sh && scripts/install.sh
+```
+
 `scripts/verify.sh` reports the two halves separately: a note for an ad-hoc build, and a **failure**
 for an app and an extension signed by *different* teams, because that combination builds, launches,
 syncs and can never badge anything. There is one more condition, and it is macOS's rather than the
