@@ -607,57 +607,41 @@ it knows are gone on its own schedule. If “Launch at Login” was ever switche
 SMAppService and only the app can take it back: the script says so instead of quietly leaving it, and
 turning it off in the app's menu (or System Settings → General → Login Items) is what removes it.
 
-## Not built yet
+## What's left
 
-Deliberate omissions and known gaps, roughly in order of value:
+Split by who it affects: gaps a user can hit in this release, and work deliberately left for later.
 
-* **A badge channel that needs no team signature.** With both bundles signed by one team the index
-  reaches the extension, which is the shipping answer; what is not built is a channel that also works
-  for an ad-hoc build, which would take an XPC Mach service from the app or a loopback server the
-  extension polls. AGENTS.md records why the file channel cannot be replaced by an App Group. The
-  container itself is a third case: nothing removes it — not a script, not the app, not root, not
-  Finder — so the uninstaller leaves it behind and says so.
+### Gaps you can hit today
 
-* **Full file history, in mirror mode.** The **Deleted Files & Versions** window now searches and
-  filters retained copies, shows their checksum and restore destination, and confirms before putting
-  a previous version back over the newer one. A deletion *and* the version a copy replaces remain
-  recoverable for 30 days everywhere; a two-way folder keeps the previous contents of anything it
-  overwrites in `.neodrop/versions/` for the same window. What mirror mode does not keep is a chain:
-  there is one previous version per path, and a later edit replaces the earlier retained version.
-* **Choosing “keep the share copy” from inside the app.** Taking the share's copy *as* the source is
-  built: the **Deleted Files & Versions** window lists unresolved conflicts per replica, shows the
-  share-file digest and matching source path, and offers an explicit **Replace with source…** action,
-  refusing directories, offline shares, a conflict whose bytes changed since it was listed, and
-  anything without a matching source file. Before writing, the share's bytes are moved into the
-  30-day recovery store, and the next sync brings the source version to the other replicas. The other
-  direction is still a Finder operation — NeoDrop never imports destination data into a protected
-  source on its own.
-* **A two-way pass that costs nothing when nothing changed.** Catching up after a Mac has been asleep
-  or offline for weeks is built, and resumable in 500-path pages: the local cursor saves a stable
-  path checkpoint, and the next scheduled sync continues where the last one ended. A failure leaves the checkpoint at the last complete page,
-  so a retry safely repeats work rather than skipping it. This bounds per-pass file reconciliation;
-  the scan of the local tree is still a full walk each pass, and that is the remaining cost of an
-  idle one.
-  The other half of that cost is now paid too: a folder that already agrees with the vault settles in
-  a **single pass** rather than being walked page by page every fifteen minutes — measured on a
-  5,000-path vault, ten passes and sixteen seconds became one pass and about one and a half seconds —
-  with the journals' byte sizes as the exact proof that nothing has been published in between.
-  That pass reads the journal **once**: it used to read and decode every journal a second time just to
-  find out which entry number to write next, which on a vault with a long history was the largest
-  single cost in it (measured on a 1,200-path vault with 2,400 journal entries: 172 ms of a 578 ms
-  pass, now 382 ms with one read). That read is bounded now too: an index beside the cursor records
-  how far into each journal this Mac has read and the state that produced, so a pass reads only the
-  lines appended since, and an idle one reads none — measured on 4,800 entries, reading them cost
-  365 ms a pass and now reads no bytes in 0.6 ms. A vault in use for years no longer pays for its
-  own history.
-* **A share that disagrees with its own journal.** A file deleted or truncated *on the share* is put
-  back from retained content, and the bytes on the share are checked by size on every sync; a
-  same-size corruption needs **Verify & Repair** (which re-hashes). An index of what the share holds
-  would make that cheap enough to do more often.
+* **Badges need a team signature.** With both bundles signed by one team the index reaches the
+  extension, which is the shipping answer. An ad-hoc build — including `swift run` — cannot write
+  into the extension's container, so it shows no badges; the unbuilt fix is an XPC Mach service from
+  the app or a loopback server the extension polls. AGENTS.md records why a file channel cannot be
+  replaced by an App Group. The container itself is a second case: nothing removes it — not a
+  script, not the app, not root, not Finder — so the uninstaller leaves it behind and says so.
+* **One previous version per path, not a history.** A deletion *and* the version a copy replaces stay
+  recoverable for 30 days everywhere, and a two-way folder keeps the previous contents of anything it
+  overwrites in `.neodrop/versions/`. What neither keeps is a chain: a later edit replaces the
+  earlier retained version rather than adding to it.
+* **Keeping the share's copy is still a Finder operation.** Taking the share's copy *as* the source
+  is built — the **Deleted Files & Versions** window lists unresolved conflicts per replica, shows
+  the share-file digest and matching source path, and offers **Replace with source…** — but the
+  reverse would import destination data into a protected source, so NeoDrop leaves it to you.
+* **A same-size corruption on the share needs Verify & Repair.** Every sync checks the share's bytes
+  by size, and a deleted or truncated file is put back from retained content; a change that keeps the
+  size is only found by re-hashing. An index of what the share holds would make that cheap enough to
+  do more often.
+* **No “the source was lost, put it back”.** Repair can rebuild a replica from the source or from
+  another replica, but there is no button that restores a lost source folder from a share.
+
+### Deliberately out of scope for v1
+
+* **A fully idle two-way pass.** Catching up, reconciliation and the journal read are all bounded: a
+  folder that agrees with the vault settles in one pass (5,000 paths: ten passes and sixteen seconds
+  became one pass of about one and a half seconds), and a pass reads only the journal lines appended
+  since the last. What is still a full walk each pass is the scan of the local tree itself.
 * **Erasure coding.** Full mirrors cost N× the storage. Sharding files so any K of N replicas can
   rebuild them would make large libraries practical, at the cost of "your data is still just files".
-* **Restoring a source from a replica.** Repair can rebuild a replica from the source or another
-  replica, but there is no "the source was lost, put it back" button yet.
 * **Bandwidth and time windows.** No throttling and no "only sync overnight" yet.
 * **Per-file progress UI.** The menu shows counts and the current path, not a list of queued files.
 * **Art direction for small sizes.** The icon is one image scaled to every size, as macOS does by
