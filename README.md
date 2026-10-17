@@ -192,7 +192,7 @@ reached for one does not stop the other.
 
 ```bash
 swift build                 # library + app
-swift test                  # 248 engine tests, all green (the badge-container one asserts whichever case this Mac is in)
+swift test                  # 268 engine tests, all green (the badge-container one asserts whichever case this Mac is in)
 swift run NeoDrop           # menu bar icon appears immediately (reads/writes ~/Library/Application Support/NeoDrop)
 ```
 
@@ -624,18 +624,20 @@ Deliberate omissions and known gaps, roughly in order of value:
   recoverable for 30 days everywhere; a two-way folder keeps the previous contents of anything it
   overwrites in `.neodrop/versions/` for the same window. What mirror mode does not keep is a chain:
   there is one previous version per path, and a later edit replaces the earlier retained version.
-* **Taking the share's copy as the source, from inside the app.** The **Deleted Files & Versions**
-  window now lists unresolved conflicts per replica, shows the share-file digest and matching source
-  path, and offers an explicit **Replace with source…** action. It refuses directories, offline shares,
-  a conflict whose bytes changed since it was listed, and anything without a matching source file.
-  Before writing, the share's bytes are moved into the 30-day recovery store as a replaced version;
-  then the normal sync brings the source version to the other replicas. Choosing “keep the share copy
-  instead” is still a Finder operation — NeoDrop never imports destination data into a protected source.
-* **Making two-way folders work with a Mac that is asleep or offline for weeks.** Catch-up is now
-  resumable in 500-path pages: the local cursor saves a stable path checkpoint, and the next scheduled
-  sync continues where the last one ended. A failure leaves the checkpoint at the last complete page,
+* **Choosing “keep the share copy” from inside the app.** Taking the share's copy *as* the source is
+  built: the **Deleted Files & Versions** window lists unresolved conflicts per replica, shows the
+  share-file digest and matching source path, and offers an explicit **Replace with source…** action,
+  refusing directories, offline shares, a conflict whose bytes changed since it was listed, and
+  anything without a matching source file. Before writing, the share's bytes are moved into the
+  30-day recovery store, and the next sync brings the source version to the other replicas. The other
+  direction is still a Finder operation — NeoDrop never imports destination data into a protected
+  source on its own.
+* **A two-way pass that costs nothing when nothing changed.** Catching up after a Mac has been asleep
+  or offline for weeks is built, and resumable in 500-path pages: the local cursor saves a stable
+  path checkpoint, and the next scheduled sync continues where the last one ended. A failure leaves the checkpoint at the last complete page,
   so a retry safely repeats work rather than skipping it. This bounds per-pass file reconciliation;
-  scanning and reading the journal still cover the full local tree and vault metadata.
+  the scan of the local tree is still a full walk each pass, and that is the remaining cost of an
+  idle one.
   The other half of that cost is now paid too: a folder that already agrees with the vault settles in
   a **single pass** rather than being walked page by page every fifteen minutes — measured on a
   5,000-path vault, ten passes and sixteen seconds became one pass and about one and a half seconds —
@@ -643,10 +645,11 @@ Deliberate omissions and known gaps, roughly in order of value:
   That pass reads the journal **once**: it used to read and decode every journal a second time just to
   find out which entry number to write next, which on a vault with a long history was the largest
   single cost in it (measured on a 1,200-path vault with 2,400 journal entries: 172 ms of a 578 ms
-  pass, now 382 ms with one read). What is not bounded yet is that one read: every pass decodes every
-  line of a journal that only ever grows, so a vault in use for years pays more each sync for the same
-  unchanged tree. Reading only the lines since the last pass — the record of which is the same byte
-  size the settle already trusts — is the next thing to build here.
+  pass, now 382 ms with one read). That read is bounded now too: an index beside the cursor records
+  how far into each journal this Mac has read and the state that produced, so a pass reads only the
+  lines appended since, and an idle one reads none — measured on 4,800 entries, reading them cost
+  365 ms a pass and now reads no bytes in 0.6 ms. A vault in use for years no longer pays for its
+  own history.
 * **A share that disagrees with its own journal.** A file deleted or truncated *on the share* is put
   back from retained content, and the bytes on the share are checked by size on every sync; a
   same-size corruption needs **Verify & Repair** (which re-hashes). An index of what the share holds
