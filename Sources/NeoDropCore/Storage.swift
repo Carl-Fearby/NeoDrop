@@ -38,6 +38,13 @@ public struct StorePaths: Sendable {
         vaultsDirectory.appendingPathComponent("\(vaultID.uuidString).json")
     }
 
+    /// How far into each of a vault's journals this machine has read, and what it read. Kept
+    /// beside the cursor because the two are committed together: an index that ran ahead of the
+    /// cursor would hide entries a failed pass never applied.
+    public func vaultJournalIndexURL(vaultID: UUID) -> URL {
+        vaultsDirectory.appendingPathComponent("\(vaultID.uuidString)-journal.json")
+    }
+
     /// Files this machine has deliberately restored after another machine deleted them, which the
     /// next reconcile must publish as new content rather than treat as a stale copy. Keyed by the
     /// link id, like the deletion records it belongs beside.

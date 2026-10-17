@@ -137,9 +137,15 @@ journals are append-only and their byte sizes prove that no other Mac has publis
 pass. Settling is not looking away: retention still runs (its window closes on the clock), a file
 dropped into the vault by hand is still noticed and adopted, and a share file that is missing or the
 wrong size is still put back from this Mac's copy. Any of those, or a change published elsewhere or
-made here, brings the full walk straight back. That pass reads the shared journal once: the entry
-number it writes under comes from the copy it has just read, not from a second read of everything the
-vault has ever recorded.
+made here, brings the full walk straight back.
+
+**And it reads only what is new.** A journal is append-only and grows for the life of the vault, so
+decoding all of it on every pass would cost the vault's *history* rather than its size — a folder in
+use for a year would get slower every sync while nothing changed. Instead this Mac keeps, beside its
+cursor, how far into each journal it has read and what that produced; a pass reads the lines written
+since, and a sync with nothing to do reads none at all. Both are committed together, so a pass that
+fails re-reads what it missed rather than skipping it, and a journal that was rewritten, truncated or
+removed is read again from the start rather than trusted.
 
 **Nothing is decided by a clock alone.** Ordering is by timestamp with millisecond precision, and
 when two entries share an instant the one written *on top of* the other's content wins — causality
@@ -492,8 +498,9 @@ Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, the 
   VaultStatus.swift      per-folder display state for the menu and Settings
 Sources/NeoDropShared/   the badge format, shared by the app and the Finder extension
 Sources/NeoDropFinder/   the Finder Sync extension: the badges next to a file's date
-Tests/NeoDropCoreTests/  251 tests: one per safety rule above, plus the vault (the paged catch-up and
-                         its cursor, and the one-pass settle when there is nothing to do), the
+Tests/NeoDropCoreTests/  268 tests: one per safety rule above, plus the vault (the paged catch-up and
+                         its cursor, the one-pass settle when there is nothing to do, and the
+                         incremental journal read — torn tails, shrunk files, lost journals), the
                          Activity window's filtering and wording, web-UI parsing, path and badge
                          cases — the container one asserts both sides of the signing rule
 Resources/AppIcon.png    master app-icon artwork, masked by scripts/make-icon.swift
@@ -518,7 +525,8 @@ build/                   generated: NeoDrop.app, .icns, .dmg
 State lives in `~/Library/Application Support/NeoDrop/`: `config.json`, a manifest per replica, the
 source hash index, `runtime-state.json`, a rolling `neodrop.log`, `deletes/` — one file per
 replica listing the deletions it is still holding — and, for two-way folders, `machine.json` (this
-Mac's identity) plus `vaults/<id>.json` (the cursor per vault). Delete that folder and NeoDrop
+Mac's identity) plus `vaults/<id>.json` (the cursor per vault) and `vaults/<id>-journal.json` (how
+far into the vault's journals this Mac has read). Delete that folder and NeoDrop
 forgets everything — your data is unaffected, but the retained copies in `.neodrop-trash/` become
 files with no record pointing at them, which is what the delete-first purge order is designed to
 avoid.

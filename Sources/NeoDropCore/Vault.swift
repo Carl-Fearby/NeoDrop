@@ -268,6 +268,125 @@ public struct VaultState: Sendable {
     public var livePaths: [String] { files.values.map(\.path) }
 }
 
+// MARK: - Reading only what is new
+
+/// What this machine has already read of a vault's journals, so a pass reads the additions rather
+/// than the whole history.
+///
+/// A journal is append-only and grows for the life of a vault, so reading every line of every
+/// journal on every pass costs the vault's *history* rather than its size: a vault in use for a
+/// year decodes a year of entries every fifteen minutes, even when nothing changed. This is the
+/// record that makes the read incremental — how far into each journal this machine has read, what
+/// it read, and nothing else.
+///
+/// Three things are kept, and each replaces something a full read would have recomputed:
+///
+/// * `files` / `tombstones` — the newest entry per path, which is what `state(from:)` produces.
+///   Merging is a maximum under `JournalEntry.precedes`, and that order is total, so merging a
+///   tail into the previous result is exactly merging everything.
+/// * `lastSeq` — the highest sequence each machine has used, so a pass can number the entries it
+///   is about to write without reading that machine's journal back to find out.
+/// * `recent` — the entries still inside the retention window. Retention needs to know which
+///   content a machine could still be asked to restore, and an entry older than the window can
+///   never be one, so that is the whole of what it needs.
+public struct JournalIndex: Codable, Sendable, Equatable {
+    public static let currentFormatVersion = 1
+
+    public var formatVersion: Int
+    /// Journal file name -> bytes read, always at a line boundary.
+    public var consumed: [String: Int64]
+    /// Journal file name -> lines read, so an unreadable line can still be named by its number.
+    public var lines: [String: Int]
+    /// Machine id -> highest sequence number read.
+    public var lastSeq: [String: Int]
+    public var files: [String: JournalEntry]
+    public var tombstones: [String: JournalEntry]
+    /// Entries whose timestamp is inside the retention window.
+    public var recent: [JournalEntry]
+
+    public init(
+        formatVersion: Int = JournalIndex.currentFormatVersion,
+        consumed: [String: Int64] = [:],
+        lines: [String: Int] = [:],
+        lastSeq: [String: Int] = [:],
+        files: [String: JournalEntry] = [:],
+        tombstones: [String: JournalEntry] = [:],
+        recent: [JournalEntry] = []
+    ) {
+        self.formatVersion = formatVersion
+        self.consumed = consumed
+        self.lines = lines
+        self.lastSeq = lastSeq
+        self.files = files
+        self.tombstones = tombstones
+        self.recent = recent
+    }
+
+    public var state: VaultState { VaultState(files: files, tombstones: tombstones) }
+
+    /// Fold entries into the newest-per-path view and the sequence record.
+    ///
+    /// Newest within the batch first, then against what was already known: two entries for one path
+    /// in a single tail must not be decided by the order they were written in.
+    public mutating func merge(_ entries: [JournalEntry]) {
+        var latest: [String: JournalEntry] = [:]
+        for entry in entries {
+            // Every entry counts towards the sequence, including one that loses the newest-per-path
+            // race: a machine whose clock stepped back writes a higher `seq` under an earlier
+            // timestamp, and reusing that number would make the next entry ambiguous.
+            lastSeq[entry.machine] = max(lastSeq[entry.machine] ?? 0, entry.seq)
+            let key = VaultPath.key(entry.path)
+            if let current = latest[key], !JournalEntry.precedes(current, entry) { continue }
+            latest[key] = entry
+        }
+        for (key, entry) in latest {
+            if let current = files[key] ?? tombstones[key], !JournalEntry.precedes(current, entry) { continue }
+            if entry.kind == .delete {
+                files.removeValue(forKey: key)
+                tombstones[key] = entry
+            } else {
+                tombstones.removeValue(forKey: key)
+                files[key] = entry
+            }
+        }
+    }
+
+    /// Forget entries the retention window has closed on. Same predicate as
+    /// `VaultStore.retainableVersions`, so what is kept here is exactly what that would have kept.
+    public mutating func prune(now: Date, retention: TimeInterval) {
+        recent.removeAll { now.timeIntervalSince($0.at) > retention }
+    }
+
+    /// The next sequence number for a machine, from what has been read rather than by reading it
+    /// again. Must answer the same thing as `VaultStore.nextSequence`.
+    public func nextSequence(machineID: String) -> Int {
+        (lastSeq[machineID] ?? 0) + 1
+    }
+}
+
+/// What one read of the journals found.
+public struct JournalRead: Sendable {
+    /// The index to keep for the next pass. Save it only alongside the cursor of a pass that
+    /// succeeded, so a failed pass re-reads its tail rather than skipping it.
+    public var index: JournalIndex
+    /// Entries appended since the previous read, in journal order. Empty when nothing moved.
+    public var entries: [JournalEntry]
+    public var errors: [String]
+    /// Bytes actually read off the share, so a pass can say what it cost and a test can prove the
+    /// read stopped growing with the vault's history.
+    public var bytesRead: Int64
+    /// True when the cache could not be trusted and everything was read again.
+    public var rebuilt: Bool
+
+    public init(index: JournalIndex, entries: [JournalEntry], errors: [String], bytesRead: Int64, rebuilt: Bool) {
+        self.index = index
+        self.entries = entries
+        self.errors = errors
+        self.bytesRead = bytesRead
+        self.rebuilt = rebuilt
+    }
+}
+
 /// Reads and writes everything inside `<vaultRoot>/.neodrop/`.
 ///
 /// The live tree stays where it was — `<vaultRoot>/Photos/a.jpg` is a real file you can open in
@@ -506,6 +625,155 @@ public struct VaultStore: Sendable {
         return (entries, errors)
     }
 
+    /// Read what the journals hold that this machine has not read yet.
+    ///
+    /// With the index from a previous pass this is one stat per journal plus a read of the bytes
+    /// appended since the offset: nothing at all for a vault that has not moved, and a bounded
+    /// amount for one that has. Passing nil — a fresh install, or an index that cannot be trusted —
+    /// reads everything once and builds the index.
+    ///
+    /// The result is the same as `loadEntries()` followed by `state(from:)`, and the state it keeps
+    /// is maintained by merging, so the two cannot drift apart: merging a tail into the previous
+    /// maximum is merging everything, because `JournalEntry.precedes` is a total order.
+    ///
+    /// What is *not* detectable here is a journal whose first bytes were replaced with different
+    /// content of the same length — a restored `.neodrop` from another vault, say. Journals are
+    /// append-only and only NeoDrop writes them, so a file that merely grew is appended to; one
+    /// that shrank, disappeared or no longer begins where it did is read again from the start.
+    public func readJournals(
+        cached: JournalIndex?,
+        now: Date = Date(),
+        retention: TimeInterval = DeleteRecord.retention,
+        sizes: [String: Int64]? = nil
+    ) -> JournalRead {
+        let sizes = sizes ?? journalSizes()
+        guard var index = cached,
+              index.formatVersion == JournalIndex.currentFormatVersion,
+              // A journal that is gone takes its entries with it, and the cached state still holds
+              // them: only a full read can say what the vault looks like now.
+              Set(index.consumed.keys).isSubset(of: Set(sizes.keys))
+        else {
+            return rebuildIndex(sizes: sizes, now: now, retention: retention)
+        }
+
+        var fresh: [JournalEntry] = []
+        var errors: [String] = []
+        var bytesRead: Int64 = 0
+
+        for name in sizes.keys.sorted() {
+            let size = sizes[name] ?? 0
+            let consumed = index.consumed[name] ?? 0
+            if consumed == size { continue }
+            // Shorter than what was already read: the file was not simply appended to.
+            if size < consumed { return rebuildIndex(sizes: sizes, now: now, retention: retention) }
+            switch readTail(of: journalsURL.appendingPathComponent(name), from: consumed, size: size) {
+            case .rewritten:
+                return rebuildIndex(sizes: sizes, now: now, retention: retention)
+            case .unreadable:
+                // The offset stays where it was, so the next pass tries the same bytes again.
+                errors.append("journal \(name) could not be read")
+            case .bytes(let data):
+                bytesRead += Int64(data.count)
+                let whole = Self.decodeLines(
+                    data, name: name, lineBase: index.lines[name] ?? 0,
+                    into: &fresh, errors: &errors
+                )
+                index.consumed[name] = consumed + whole.consumed
+                index.lines[name] = whole.lines
+            }
+        }
+
+        index.merge(fresh)
+        index.recent.append(contentsOf: fresh)
+        index.prune(now: now, retention: retention)
+        return JournalRead(index: index, entries: fresh, errors: errors, bytesRead: bytesRead, rebuilt: false)
+    }
+
+    private func rebuildIndex(sizes: [String: Int64], now: Date, retention: TimeInterval) -> JournalRead {
+        var index = JournalIndex()
+        var entries: [JournalEntry] = []
+        var errors: [String] = []
+        var bytesRead: Int64 = 0
+        for name in sizes.keys.sorted() {
+            guard let data = try? Data(contentsOf: journalsURL.appendingPathComponent(name)) else {
+                errors.append("journal \(name) could not be read")
+                continue
+            }
+            bytesRead += Int64(data.count)
+            let whole = Self.decodeLines(data, name: name, lineBase: 0, into: &entries, errors: &errors)
+            // A torn tail is not consumed: if the line is ever completed, it is still new.
+            index.consumed[name] = whole.consumed
+            index.lines[name] = whole.lines
+        }
+        index.merge(entries)
+        index.recent = entries
+        index.prune(now: now, retention: retention)
+        return JournalRead(index: index, entries: entries, errors: errors, bytesRead: bytesRead, rebuilt: true)
+    }
+
+    private enum TailRead {
+        case bytes(Data)
+        /// The byte before the offset is not a newline, so the file was rewritten rather than
+        /// appended to and nothing cached about its first bytes can be trusted.
+        case rewritten
+        case unreadable
+    }
+
+    private func readTail(of url: URL, from offset: Int64, size: Int64) -> TailRead {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return .unreadable }
+        defer { try? handle.close() }
+        do {
+            if offset > 0 {
+                // One byte before the offset says whether the prefix is still the one that was
+                // read. It costs a read of one byte, and it is what keeps a rewritten journal from
+                // being joined to a stale offset.
+                try handle.seek(toOffset: UInt64(offset - 1))
+                guard let boundary = try handle.read(upToCount: 1), boundary == Self.newline else {
+                    return .rewritten
+                }
+            }
+            try handle.seek(toOffset: UInt64(offset))
+            guard let data = try handle.read(upToCount: Int(size - offset)) else { return .unreadable }
+            return .bytes(data)
+        } catch {
+            return .unreadable
+        }
+    }
+
+    private static let newline = Data([0x0a])
+
+    /// Decode the whole lines in `data`, appending to `entries`. Returns how many of its bytes were
+    /// whole lines, and how many lines that was.
+    ///
+    /// A last line with no newline is a tear from a crash mid-append. It is ignored rather than
+    /// reported, exactly as `loadEntries` ignores it — the change it described is on the share and
+    /// the next pass publishes it again — and it is *not* consumed, so completing the line later
+    /// still gets it read.
+    static func decodeLines(
+        _ data: Data,
+        name: String,
+        lineBase: Int,
+        into entries: inout [JournalEntry],
+        errors: inout [String]
+    ) -> (consumed: Int64, lines: Int) {
+        let decoder = JournalCoding.decoder()
+        var position = 0
+        var lines = lineBase
+        while position < data.count {
+            guard let range = data.range(of: newline, in: position..<data.count) else { break }
+            let line = data[position..<range.lowerBound]
+            position = range.upperBound
+            lines += 1
+            guard !line.isEmpty else { continue }
+            if let entry = try? decoder.decode(JournalEntry.self, from: Data(line)) {
+                entries.append(entry)
+            } else {
+                errors.append("journal \(name) has an unreadable line \(lines)")
+            }
+        }
+        return (Int64(position), lines)
+    }
+
     /// Merge every journal into one view of the tree. The newest entry for a path wins; a delete
     /// is just another entry, which is what stops a deleted file from coming back on the next
     /// machine that still has it.
@@ -658,6 +926,30 @@ public struct VaultCursorStore: Sendable {
 
     public func save(_ cursor: VaultCursor) throws {
         try JSONFile.save(cursor, to: paths.vaultCursorURL(vaultID: cursor.vaultID))
+    }
+}
+
+/// Reads and writes how far into a vault's journals this machine has read.
+///
+/// Written through `JournalCoding` rather than the plain `JSONFile` encoder on purpose: the index
+/// holds journal entries, and the plain encoder keeps timestamps to whole seconds. A cached entry
+/// whose timestamp lost its milliseconds would compare as *newer* than an entry written in the same
+/// second after it, which is the ordering bug that reverted real edits once already.
+public struct JournalIndexStore: Sendable {
+    public let paths: StorePaths
+
+    public init(paths: StorePaths = .standard) { self.paths = paths }
+
+    public func load(vaultID: UUID) -> JournalIndex? {
+        let url = paths.vaultJournalIndexURL(vaultID: vaultID)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JournalCoding.decoder().decode(JournalIndex.self, from: data)
+    }
+
+    public func save(_ index: JournalIndex, vaultID: UUID) throws {
+        let url = paths.vaultJournalIndexURL(vaultID: vaultID)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JournalCoding.encoder().encode(index).write(to: url, options: .atomic)
     }
 }
 

@@ -15,7 +15,7 @@ server and no cloud component.
 
 ```bash
 swift build                                        # compile everything
-swift test                                         # 251 engine tests, all green
+swift test                                         # 268 engine tests, all green
 swift run NeoDrop                                  # run the app (menu bar icon)
 swift build -c release --show-bin-path             # locate the release binary
 scripts/package.sh [--arch universal] [--no-dmg]   # .app + DMG, ad-hoc signed by default
@@ -216,13 +216,29 @@ Things that are easy to get wrong and are therefore deliberate:
   1,200-path vault whose journal held 2,400 entries: 172 ms of a 578 ms settled pass, every fifteen
   minutes, growing with the vault's *history* rather than its size. The sequence is now derived from
   the entries already in hand (`VaultSync.nextSequence(in:machineID:)`), which brought the same
-  settled pass to 382 ms (`testTheSequenceComesFromTheEntriesThePassAlreadyRead`). What is still
-  unbounded is the read itself: every pass decodes every line of a journal that only grows, so a vault
-  in use for years pays more each sync for the same unchanged tree. Bounding it means keeping the
-  folded state per machine and reading only the bytes after the last line it folded — the same
-  byte-size proof the settle already rests on — and that is **not built**; it is the next real win
-  here, and a cached state that is ever wrong means skipped changes, so it needs the same care the
-  settle got.
+  settled pass to 382 ms (`testTheSequenceComesFromTheEntriesThePassAlreadyRead`).
+* **And it reads only what was appended since the last pass.** A journal grows for the life of a
+  vault, so decoding all of it every pass costs its *history*: a vault in use for a year pays more
+  each sync for the same unchanged tree. `JournalIndex` (`Vault.swift`, local, beside the cursor)
+  is what makes the read incremental — how far into each journal has been read, the merged
+  newest-per-path state, each machine's highest `seq`, and the entries still inside the retention
+  window. Those four are the whole of what a full read was used for: `state(from:)`, `nextSequence`
+  and `retainableVersions` all answer from it. Merging is sound because `JournalEntry.precedes` is a
+  total order, so folding a tail into a previous maximum is folding everything. Measured on a
+  1,200-path vault whose journal held 4,800 entries (1.15 MB): reading and folding all of it cost
+  365 ms per pass; an idle pass now reads **0 bytes in 0.6 ms**, and a pass after one publish reads
+  the 337-byte line that announced it. `SettledSyncTests.testASyncWithNothingToDoSettlesInOnePass`
+  asserts the zero and `testAPassReadsWhatWasAppendedRatherThanTheWholeHistory` the bound.
+
+  The ways this can be wrong are the interesting part, and each has a test (`JournalIndexTests`): a
+  tail that ends in a tear is ignored *and not consumed*, so completing the line later still reads
+  it; a journal that shrank is not appended to and is read again from the start; one that vanished
+  takes its entries with it, so the state is rebuilt rather than keeping ghosts; and what was read is
+  checked against the file by the byte before the offset, which is a newline for an append and is
+  not for a rewrite. The index is saved **only with the cursor of a pass that succeeded** — an index
+  that ran ahead of a failed pass would skip entries the next pass still has to apply — and it is
+  written through `JournalCoding`, because the plain encoder would drop the milliseconds that the
+  merge orders by.
 * **No `pruneEmptyDirectories` on the local side.** On a replica an empty directory is leftovers; a
   person's working copy is not NeoDrop's to tidy.
 

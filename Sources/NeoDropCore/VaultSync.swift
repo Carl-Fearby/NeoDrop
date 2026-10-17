@@ -42,6 +42,12 @@ public struct VaultSyncSummary: Sendable {
     public var catchUpPending = false
     /// Number of paths included in this reconcile pass.
     public var catchUpProcessed = 0
+    /// Bytes of journal actually read off the share during this pass.
+    ///
+    /// Not shown anywhere: it exists so "a sync with nothing to do reads nothing" is a claim that
+    /// can be measured rather than asserted, and so a regression that starts decoding the vault's
+    /// whole history again shows up as a number instead of a slow sync nobody can explain.
+    public var journalBytesRead: Int64 = 0
 
     public init(vaultID: UUID, vaultName: String, machineName: String, phase: SyncPhase, startedAt: Date) {
         self.vaultID = vaultID
@@ -78,6 +84,7 @@ public struct VaultSyncSummary: Sendable {
         bytesDown += later.bytesDown
         errors += later.errors
         catchUpProcessed += later.catchUpProcessed
+        journalBytesRead += later.journalBytesRead
         seeded = seeded || later.seeded
         // The last pass has the final word on these: they describe what is true now, not what each
         // page added on the way.
@@ -129,6 +136,7 @@ public actor VaultSync {
     private let paths: StorePaths
     private let machineStore: MachineIdentityStore
     private let cursorStore: VaultCursorStore
+    private let journalIndexStore: JournalIndexStore
     private let indexStore: SourceIndexStore
     private let indexer = SourceIndexer()
 
@@ -138,6 +146,7 @@ public actor VaultSync {
         self.paths = paths
         self.machineStore = MachineIdentityStore(paths: paths)
         self.cursorStore = VaultCursorStore(paths: paths)
+        self.journalIndexStore = JournalIndexStore(paths: paths)
         self.indexStore = SourceIndexStore(paths: paths)
     }
 
@@ -200,9 +209,17 @@ public actor VaultSync {
         // are working leaves the record behind reality and the next pass walks. See
         // `VaultCursor.catchUpJournalBytes`.
         let journalBytes = store.journalSizes()
-        let loaded = store.loadEntries()
-        summary.errors.append(contentsOf: loaded.errors)
-        var state = store.state(from: loaded.entries)
+        // Only what has been appended since the last pass is read and decoded; the merged view of
+        // everything before it is kept beside the cursor. A vault that has not moved costs one
+        // stat per journal and no decode at all.
+        let journalRead = store.readJournals(
+            cached: journalIndexStore.load(vaultID: identity.id),
+            sizes: journalBytes
+        )
+        summary.errors.append(contentsOf: journalRead.errors)
+        summary.journalBytesRead = journalRead.bytesRead
+        let journalIndex = journalRead.index
+        var state = journalIndex.state
 
         var cursor = cursorStore.load(vaultID: identity.id) ?? VaultCursor(vaultID: identity.id, machineID: machine.id)
         if cursor.machineID != machine.id {
@@ -269,7 +286,7 @@ public actor VaultSync {
         // leave it invisible on every Mac forever.
         let undeletes = PendingUndeleteStore(paths: paths)
         let pendingUndeletes = undeletes.load(linkID: link.id)
-        var journal = JournalWriter(seq: Self.nextSequence(in: loaded.entries, machineID: machine.id.uuidString))
+        var journal = JournalWriter(seq: journalIndex.nextSequence(machineID: machine.id.uuidString))
         var adopted = 0
         // One walk of the share answers everything this pass needs from it: what is in the live
         // tree, of what size, and what nobody has claimed. Per path it would be one round trip each.
@@ -320,7 +337,8 @@ public actor VaultSync {
                 state: state,
                 live: liveByKey,
                 local: local,
-                loadedEntries: loaded.entries,
+                newEntries: journalRead.entries,
+                journalIndex: journalIndex,
                 base: &base,
                 cursor: &cursor,
                 cursorStore: cursorStore,
@@ -629,7 +647,7 @@ public actor VaultSync {
         // Retention housekeeping: hand back what no machine can still need, and only after the
         // window has closed.
         let now = Date()
-        let keep = store.retainableVersions(from: loaded.entries, within: DeleteRecord.retention, now: now)
+        let keep = store.retainableVersions(from: journalIndex.recent, within: DeleteRecord.retention, now: now)
         summary.versionsPurged = store.purgeVersions(keeping: keep, olderThan: DeleteRecord.retention, now: now)
 
         if summary.errors.isEmpty {
@@ -647,7 +665,7 @@ public actor VaultSync {
             cursor.catchUpDirtyPaths = dirtyAfter.isEmpty ? nil : dirtyAfter.sorted()
             // What the journal held when this pass finished, so the next one can tell what arrived
             // while it was behind without trusting two differently-rounded timestamps.
-            cursor.catchUpSeenAt = max(cursor.catchUpSeenAt ?? 0, loaded.entries.map { Self.millis($0.at) }.max() ?? 0)
+            cursor.catchUpSeenAt = max(cursor.catchUpSeenAt ?? 0, journalRead.entries.map { Self.millis($0.at) }.max() ?? 0)
             // The journal sizes this pass *opened* with. A pass that published has therefore
             // recorded less than the journal now holds, and the next pass walks rather than settling
             // — which is what we want: something changed, and it was us.
@@ -655,6 +673,9 @@ public actor VaultSync {
             cursor.lastSync = now
             do {
                 try cursorStore.save(cursor)
+                // Saved with the cursor, never before it: an index that ran ahead of a pass that
+                // then failed would skip entries the next pass still has to apply.
+                try journalIndexStore.save(journalIndex, vaultID: identity.id)
                 var committedIndex = previousIndex
                 for key in batchKeys {
                     guard let file = local[key]?.file else { continue }
@@ -689,13 +710,13 @@ public actor VaultSync {
         Int64((date.timeIntervalSince1970 * 1000).rounded())
     }
 
-    /// The next sequence number for this machine's journal, from entries this pass already read.
+    /// The next sequence number for this machine's journal, from entries already in hand.
     ///
     /// `VaultStore.nextSequence` answers the same question by reading and decoding *every* journal
-    /// again, and a pass reads them all anyway (`loaded`, above) before it needs a sequence — so
-    /// that second read was pure duplication on the most expensive thing a pass does. Measured on a
-    /// 1,200-path vault whose journal held 2,400 entries: 172 ms of a 578 ms pass, every fifteen
-    /// minutes, growing with the vault's history rather than with its size.
+    /// again, which measured at 172 ms of a 578 ms pass on a vault whose journal held 2,400 entries.
+    /// A pass no longer has all the entries in hand either — it reads only what was appended since
+    /// the last one, so it uses `JournalIndex.nextSequence`, which answers from the highest sequence
+    /// it has already seen. All three have to agree, and a test says so.
     static func nextSequence(in entries: [JournalEntry], machineID: String) -> Int {
         (entries.lazy.filter { $0.machine == machineID }.map(\.seq).max() ?? 0) + 1
     }
@@ -716,7 +737,8 @@ public actor VaultSync {
         state: VaultState,
         live: [String: (path: String, size: Int64)],
         local: [String: (file: ScannedFile, sha: String)],
-        loadedEntries: [JournalEntry],
+        newEntries: [JournalEntry],
+        journalIndex: JournalIndex,
         base: inout [String: String],
         cursor: inout VaultCursor,
         cursorStore: VaultCursorStore,
@@ -743,7 +765,7 @@ public actor VaultSync {
         }
 
         summary.versionsPurged = store.purgeVersions(
-            keeping: store.retainableVersions(from: loadedEntries, within: DeleteRecord.retention, now: now),
+            keeping: store.retainableVersions(from: journalIndex.recent, within: DeleteRecord.retention, now: now),
             olderThan: DeleteRecord.retention,
             now: now
         )
@@ -761,10 +783,11 @@ public actor VaultSync {
         cursor.catchUpAfter = nil
         cursor.catchUpDirtyPaths = nil
         cursor.catchUpJournalBytes = journalBytes
-        cursor.catchUpSeenAt = max(cursor.catchUpSeenAt ?? 0, loadedEntries.map { Self.millis($0.at) }.max() ?? 0)
+        cursor.catchUpSeenAt = max(cursor.catchUpSeenAt ?? 0, newEntries.map { Self.millis($0.at) }.max() ?? 0)
         cursor.lastSync = now
         do {
             try cursorStore.save(cursor)
+            try journalIndexStore.save(journalIndex, vaultID: cursor.vaultID)
             try indexStore.save(index)
         } catch {
             summary.errors.append("Could not save sync progress: \(error.localizedDescription)")

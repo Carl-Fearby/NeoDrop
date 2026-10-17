@@ -83,6 +83,37 @@ final class SettledSyncTests: XCTestCase {
         XCTAssertEqual(settled.errors, [])
         XCTAssertEqual(settled.phase, .finished)
         XCTAssertEqual(sandbox.journalLines(machine: 1), journalBefore, "a settled pass announces nothing")
+        XCTAssertEqual(settled.journalBytesRead, 0,
+                       "and it decodes nothing: the whole history is not read again to say so")
+    }
+
+    /// The bound the index exists for: a journal grows with the vault's history, so reading all of
+    /// it every pass is work that gets worse the longer a vault is used. A pass now reads what was
+    /// appended since the last one, which for a publish on another machine is one line.
+    func testAPassReadsWhatWasAppendedRatherThanTheWholeHistory() async throws {
+        try await caughtUp(total: VaultSync.catchUpBatchSize + 23)
+        let whole = totalJournalBytes()
+        XCTAssertGreaterThan(whole, 1_000, "the history has to be worth not reading")
+
+        try sandbox.write("changed on A", machine: 0, to: "file-0500.txt")
+        try await settle(0)
+
+        let (_, applied) = try await settle(1)
+
+        XCTAssertEqual(applied.downloaded, 1)
+        XCTAssertGreaterThan(applied.journalBytesRead, 0, "the entry that announced the change is read")
+        XCTAssertLessThan(applied.journalBytesRead, whole / 20,
+                          "and of \(whole) bytes of history, only that entry")
+    }
+
+    private func totalJournalBytes() -> Int64 {
+        let journals = sandbox.vault.appendingPathComponent("\(VaultStore.metadataDirectoryName)/journals")
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: journals.path)) ?? []
+        return names.reduce(0) { total, name in
+            let url = journals.appendingPathComponent(name)
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            return total + Int64(size)
+        }
     }
 
     /// The record that makes settling possible has to be written by the settled pass itself, or the
