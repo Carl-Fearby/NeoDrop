@@ -614,11 +614,12 @@ Split by who it affects: gaps a user can hit in this release, and work deliberat
 ### Gaps you can hit today
 
 * **Badges need a team signature.** With both bundles signed by one team the index reaches the
-  extension, which is the shipping answer. An ad-hoc build — including `swift run` — cannot write
-  into the extension's container, so it shows no badges; the unbuilt fix is an XPC Mach service from
-  the app or a loopback server the extension polls. AGENTS.md records why a file channel cannot be
-  replaced by an App Group. The container itself is a second case: nothing removes it — not a
-  script, not the app, not root, not Finder — so the uninstaller leaves it behind and says so.
+  extension, which is the shipping answer. An ad-hoc build cannot write into the extension's
+  container, so it shows no badges, and a `swift run` is refused even when signed because a shell is
+  its responsible process; the unbuilt fix is an XPC Mach service from the app or a loopback server
+  the extension polls. AGENTS.md records why a file channel cannot be replaced by an App Group. The
+  container itself is a second case: nothing removes it — not a script, not the app, not root, not
+  Finder — so the uninstaller leaves it behind and says so.
 * **One previous version per path, not a history.** A deletion *and* the version a copy replaces stay
   recoverable for 30 days everywhere, and a two-way folder keeps the previous contents of anything it
   overwrites in `.neodrop/versions/`. What neither keeps is a chain: a later edit replaces the
