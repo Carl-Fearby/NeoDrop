@@ -47,6 +47,9 @@ final class AppModel: ObservableObject {
     let vaultEngine: VaultSync
     private let configStore: ConfigStore
     private let machineStore: MachineIdentityStore
+    /// The channel the Finder extension reads when the container file is closed to it — an ad-hoc
+    /// build. Started at launch so it can answer before the first sync has anything to say.
+    private let badgeServer = BadgeIndexServer()
 
     /// The loopback page behind “Deleted Files…”. Started once at launch; `deletedFilesURL` is
     /// what the web view loads, and nil only while the server is coming up or if it failed.
@@ -77,6 +80,7 @@ final class AppModel: ObservableObject {
         // Read (or mint) this machine's identity up front: it is written into the journal of every
         // vault, and a machine that changed its id would look brand new to everyone else.
         self.machineName = machineStore.loadOrCreate().name
+        badgeServer.start()
     }
 
     func setMachineName(_ name: String) {
@@ -690,6 +694,9 @@ final class AppModel: ObservableObject {
     /// launch, after a sync or a verify (both end in `refresh`), and after settings are saved.
     func publishFinderStatus() {
         let index = FinderStatusIndex.build(config: config, paths: paths, progress: progress)
+        // Over the channel that does not need a team identity, before the file writes below — one
+        // of which is exactly what an ad-hoc build is refused at.
+        badgeServer.publish(index)
         do {
             // Two copies of the same bytes, on purpose: the state directory keeps it with the rest of
             // what NeoDrop knows (and is what the tests and scripts/e2e.sh read), and the Finder

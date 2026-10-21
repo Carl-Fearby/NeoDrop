@@ -114,7 +114,7 @@ public struct FinderRoot: Codable, Sendable, Hashable {
 ///
 /// An entry may name a directory, in which case it covers everything below it (a trash directory is
 /// marked once, not once per retained copy), and the longest matching entry wins.
-public struct FinderStatusIndex: Codable, Sendable {
+public struct FinderStatusIndex: Codable, Sendable, Equatable {
     public static let currentVersion = 1
     /// Where the app writes it and the extension reads it, relative to the support directory.
     public static let fileName = "finder-status.json"
@@ -299,14 +299,14 @@ extension FinderStatusIndex {
     /// — need the same encoding on both sides, and they cannot share the engine's `JSONFile` (the
     /// extension does not link it). So the format owns its own coding, with whole-second ISO-8601
     /// dates, which both sides read the same way.
-    private static func encoder() -> JSONEncoder {
+    static func encoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
         return encoder
     }
 
-    private static func decoder() -> JSONDecoder {
+    static func decoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return decoder
@@ -332,6 +332,19 @@ extension FinderStatusIndex {
     /// claiming "in sync" on no evidence is exactly the lie a badge must not tell.
     public static func load(from url: URL) -> FinderStatusIndex? {
         guard let data = try? Data(contentsOf: url) else { return nil }
+        return decode(data)
+    }
+
+    /// The same bytes the file holds, for the channel that does not use a file: the app answers the
+    /// extension over XPC with exactly this encoding, so a build with a team identity (which reads
+    /// the file) and an ad-hoc one (which asks the app) cannot disagree about what an index says.
+    public func encoded() throws -> Data {
+        try Self.encoder().encode(self)
+    }
+
+    /// Nil for bytes that are not an index, and for one written by a newer NeoDrop: a future index
+    /// may mean something this build cannot answer, and a wrong badge is worse than no badge.
+    public static func decode(_ data: Data) -> FinderStatusIndex? {
         guard let index = try? decoder().decode(FinderStatusIndex.self, from: data) else { return nil }
         guard index.version <= currentVersion else { return nil }
         return index

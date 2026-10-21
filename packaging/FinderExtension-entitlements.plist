@@ -1,27 +1,37 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Entitlements for NeoDropFinder.appex: the App Sandbox, and nothing else.
+<!-- Entitlements for NeoDropFinder.appex: the App Sandbox, plus an outgoing loopback connection.
 
      The App Sandbox is not a choice here. PlugInKit refuses to register an extension without it — the
      refusal is a line in the system log ("plug-ins must be sandboxed") and nothing else: `pluginkit -m
-     -p com.apple.FinderSync` simply never lists it, and Finder shows no badges and no error. That is
-     what a sandboxed extension buys and what it costs:
+     -p com.apple.FinderSync` simply never lists it, and Finder shows no badges and no error.
 
-       * the extension can read nothing outside its own container;
-       * the app publishes the badge index into that container from outside — the only channel the two
-         processes need — which works when both bundles carry the same team identity and is refused
-         otherwise: an ad-hoc build badges nothing at all (macOS 14+ protects a container from other
-         teams). No App Group is declared here either; see packaging/entitlements.plist for the
-         measurements behind both decisions, and AGENTS.md for the log lines.
+     Two channels carry the badge index out of that sandbox:
 
-     Deliberately absent: any file access. The extension never opens the user's files — Finder hands it
-     URLs and the index hands it badge identifiers, and both are just strings — so it needs no
-     user-selected, home-relative or network entitlement, and adding one would widen what a compromised
-     extension could reach for no benefit. scripts/verify.sh checks that the sandbox is declared and
-     that an App Group has not been added back: it cannot work from a non-sandboxed app. -->
+       * The app writes it into the extension's container from outside. macOS 14+ protects a container
+         from other teams, so this works only when both bundles carry the same team identity: an
+         ad-hoc build (no team at all) is refused, and that channel stays dark.
+       * The app serves the same bytes on loopback (a small fixed port range) and the extension fetches
+         them over HTTP. That is what `network.client` is for, and it is the channel an ad-hoc build
+         uses. Apple DTS confirms local-network privacy does not apply to loopback.
+
+     A Mach service was tried first and does not work: `NSXPCListener(machServiceName:)` needs launchd
+     to own the name, and a name registered by an ordinary app is invisible to a lookup — measured as
+     "Connection init failed at lookup with error 3 - No such process" from a test process and from a
+     real app started by LaunchServices.
+
+     Deliberately absent: any file access, and any App Group. The extension never opens the user's
+     files — Finder hands it URLs and the index hands it badge identifiers, and both are just strings
+     — so it needs no user-selected, home-relative or network-server entitlement. An App Group cannot
+     be the channel either: `~/Library/Group Containers` is closed to the non-sandboxed app (it must
+     not be sandboxed, because it mirrors to /Volumes), and a sandboxed process is refused when
+     another bundle created the container. scripts/verify.sh checks the sandbox, the absence of an App
+     Group, and that this outgoing connection is declared. -->
 <plist version="1.0">
 <dict>
   <key>com.apple.security.app-sandbox</key>
+  <true/>
+  <key>com.apple.security.network.client</key>
   <true/>
 </dict>
 </plist>

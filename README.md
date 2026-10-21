@@ -168,7 +168,7 @@ all enforced in code and covered by tests:
 | Only files NeoDrop wrote are ever deleted (tracked in a per-replica manifest) | A replica can share a volume with other data; foreign files are never touched |
 | A file NeoDrop did not write is never replaced, only refused and reported | A name collision in a shared folder is no reason to lose somebody's file: the copy on the share may exist nowhere else. A file that is already there with the source's exact bytes is *adopted* instead, which is what makes a clean install cheap |
 | A copy on a share that is not the version NeoDrop recorded is left alone by sync | An edit made straight on the share, a partial upload, or a folder where a file belongs exists nowhere else either — it is named in the run's report and the next sync takes the path once it is moved aside. **Verify & Repair** is explicit permission to replace a bad copy, but it retains the bytes first |
-| A replica root must already exist — it is never created | An unmounted share would otherwise make `/Volumes/NAS2/NeoDrop` resolve to the boot disk, and you'd "mirror" onto your own SSD |
+| A replica root must already exist — it is never created — and a folder that sits where an unmounted share belongs is refused | An unmounted share would otherwise make `/Volumes/NAS2/NeoDrop` resolve to the boot disk, and you'd "mirror" onto your own SSD. Existence alone is not enough: macOS can leave the mount point behind as an empty directory, so the replica also records the volume it last synced to, and a path under a mount root that now resolves to the boot disk is refused. Measured: before this, ejecting a volume and putting an empty folder at its path made the next sync mirror the source into it |
 | Deletions are refused when a source could not be read | A renamed or unplugged source folder must never be interpreted as "everything was deleted" |
 | More than 25% of a replica (or 25 files) deleted in one run is refused unless explicitly allowed | Stops the signature mirroring disaster: one bad sync empties the NAS |
 | Every copy goes through a temp file plus a rename in the destination folder | A dropped SMB connection leaves the old file, not a truncated new one |
@@ -192,7 +192,7 @@ reached for one does not stop the other.
 
 ```bash
 swift build                 # library + app
-swift test                  # 268 engine tests, all green (the badge-container one asserts whichever case this Mac is in)
+swift test                  # 284 engine tests, all green (the badge-container one asserts whichever case this Mac is in)
 swift run NeoDrop           # menu bar icon appears immediately (reads/writes ~/Library/Application Support/NeoDrop)
 ```
 
@@ -428,12 +428,20 @@ A file outside every protected folder gets no icon at all — a badge on everyth
 A folder shows the worst of what is inside it, so one file needing attention is visible from the
 folder above. Right-click a file → **Show NeoDrop Status** for the full report (above).
 
-**The badges need one team signature and a normal launch.** The state reaches the extension through a
-file the app writes into the extension's sandbox container, and since macOS 14 a container is closed
-to processes outside the *team* that owns it. An ad-hoc signature — the default build here, and all
-`swift run` gives you — has no team at all, so the app is refused, logs
-`Finder badges could not be updated … You don't have permission to save the file …`, and badges
-nothing. Sign both bundles with one identity and it publishes:
+**Badges reach Finder even in an ad-hoc build.** Two channels carry the index to the extension, and
+it tries them in this order:
+
+* the **container file** — the app writes it into the extension's sandbox container, which is the one
+  place a sandboxed process may read. Since macOS 14 that container is closed to processes outside
+  the *team* that owns it, so an ad-hoc signature (no team at all) is refused there: the app logs
+  `Finder badges could not be updated … You don't have permission to save the file …` and carries on;
+* **loopback HTTP**, which needs no team and no signature: the app serves the same bytes on
+  `127.0.0.1` (ports 47623–47632, first free one) and the extension fetches them. This is what the
+  default build uses, and it works whether Finder, `open` or a shell started the app — nothing about
+  loopback follows the responsible process the way the container decision does.
+
+A team signature is therefore a *nicety*, not a requirement for badges. If you have an identity and
+want the file channel to work as well:
 
 ```bash
 MACOS_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" scripts/package.sh && scripts/install.sh
@@ -449,10 +457,10 @@ MACOS_SIGN_IDENTITY="$(security find-identity -v -p codesigning | awk -F'\"' '/A
 
 `scripts/verify.sh` reports the two halves separately: a note for an ad-hoc build, and a **failure**
 for an app and an extension signed by *different* teams, because that combination builds, launches,
-syncs and can never badge anything. There is one more condition, and it is macOS's rather than the
-app's: it has to be started by LaunchServices (Finder, `open`, a login item), not launched from a
-shell — the container decision follows the responsible process, so a shell-started run is refused
-however the build is signed. AGENTS.md has the measurements, including the log lines.
+syncs and can never badge anything through the file. It also checks the channel that does not care
+about teams: both binaries carry the same path, and the extension holds the one entitlement it needs
+to fetch it (`com.apple.security.network.client`) and no more. AGENTS.md has the measurements,
+including why a Mach service was tried first and does not work.
 
 This is a Finder extension, so it has to be switched on once: `scripts/install.sh` does it for you,
 or **System Settings → General → Login Items & Extensions → Finder Extensions → NeoDrop**. The
@@ -469,7 +477,10 @@ scripts/fake-nas.sh destroy      # unmount and delete them
 ```
 
 They are genuine mounted APFS volumes, so the app treats them exactly like NAS shares — including
-the warning when two replicas share a volume.
+the warning when two replicas share a volume. `scripts/e2e.sh --volumes` goes one step further and
+reproduces the failure a real share has: it mirrors onto a throwaway volume, ejects it, puts an empty
+folder back at the mount point, and asserts the next sync refuses that folder instead of filling it —
+then reattaches the volume and checks the file it missed arrives.
 
 ## Layout
 
@@ -498,11 +509,13 @@ Sources/NeoDrop/         menu bar app: status item, menu, SwiftUI settings, the 
   VaultStatus.swift      per-folder display state for the menu and Settings
 Sources/NeoDropShared/   the badge format, shared by the app and the Finder extension
 Sources/NeoDropFinder/   the Finder Sync extension: the badges next to a file's date
-Tests/NeoDropCoreTests/  268 tests: one per safety rule above, plus the vault (the paged catch-up and
+Tests/NeoDropCoreTests/  284 tests: one per safety rule above, plus the vault (the paged catch-up and
                          its cursor, the one-pass settle when there is nothing to do, and the
                          incremental journal read — torn tails, shrunk files, lost journals), the
                          Activity window's filtering and wording, web-UI parsing, path and badge
-                         cases — the container one asserts both sides of the signing rule
+                         cases — the container one asserts both sides of the signing rule, and the
+                         loopback channel is exercised over real HTTP (served, withdrawn, a foreign
+                         Host, an unknown path, a wrong verb, a future version)
 Resources/AppIcon.png    master app-icon artwork, masked by scripts/make-icon.swift
 Resources/MenuBarIcon*.png  menu bar template icon at 1x/2x/3x, plus the .svg master
 Resources/dmg-background.png  installer window wallpaper, as supplied (the master)
@@ -609,44 +622,15 @@ turning it off in the app's menu (or System Settings → General → Login Items
 
 ## What's left
 
-Split by who it affects: gaps a user can hit in this release, and work deliberately left for later.
+Four gaps a user can hit in this release: only one previous version is kept per path, not a chain;
+keeping the share's copy is still a Finder operation; a corruption that keeps a file's size is only
+found by **Verify & Repair**; and there is no button to restore a lost source from a share. Badges
+are no longer on that list — an ad-hoc build serves the index over loopback now — though the
+Finder-side half of that channel still needs confirming on a real install.
 
-### Gaps you can hit today
-
-* **Badges need a team signature.** With both bundles signed by one team the index reaches the
-  extension, which is the shipping answer. An ad-hoc build cannot write into the extension's
-  container, so it shows no badges, and a `swift run` is refused even when signed because a shell is
-  its responsible process; the unbuilt fix is an XPC Mach service from the app or a loopback server
-  the extension polls. AGENTS.md records why a file channel cannot be replaced by an App Group. The
-  container itself is a second case: nothing removes it — not a script, not the app, not root, not
-  Finder — so the uninstaller leaves it behind and says so.
-* **One previous version per path, not a history.** A deletion *and* the version a copy replaces stay
-  recoverable for 30 days everywhere, and a two-way folder keeps the previous contents of anything it
-  overwrites in `.neodrop/versions/`. What neither keeps is a chain: a later edit replaces the
-  earlier retained version rather than adding to it.
-* **Keeping the share's copy is still a Finder operation.** Taking the share's copy *as* the source
-  is built — the **Deleted Files & Versions** window lists unresolved conflicts per replica, shows
-  the share-file digest and matching source path, and offers **Replace with source…** — but the
-  reverse would import destination data into a protected source, so NeoDrop leaves it to you.
-* **A same-size corruption on the share needs Verify & Repair.** Every sync checks the share's bytes
-  by size, and a deleted or truncated file is put back from retained content; a change that keeps the
-  size is only found by re-hashing. An index of what the share holds would make that cheap enough to
-  do more often.
-* **No “the source was lost, put it back”.** Repair can rebuild a replica from the source or from
-  another replica, but there is no button that restores a lost source folder from a share.
-
-### Deliberately out of scope for v1
-
-* **A fully idle two-way pass.** Catching up, reconciliation and the journal read are all bounded: a
-  folder that agrees with the vault settles in one pass (5,000 paths: ten passes and sixteen seconds
-  became one pass of about one and a half seconds), and a pass reads only the journal lines appended
-  since the last. What is still a full walk each pass is the scan of the local tree itself.
-* **Erasure coding.** Full mirrors cost N× the storage. Sharding files so any K of N replicas can
-  rebuild them would make large libraries practical, at the cost of "your data is still just files".
-* **Bandwidth and time windows.** No throttling and no "only sync overnight" yet.
-* **Per-file progress UI.** The menu shows counts and the current path, not a list of queued files.
-* **Art direction for small sizes.** The icon is one image scaled to every size, as macOS does by
-  default. Real icon sets simplify at 16–32px, where a detailed render turns to mush.
+[ROADMAP.md](ROADMAP.md) has the order these are tackled in, the approach for each, and what counts
+as done — plus the work deliberately left for later: an incremental local scan, erasure coding,
+bandwidth windows, per-file progress, and icon art for small sizes.
 
 ## Licence
 

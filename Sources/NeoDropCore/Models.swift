@@ -211,19 +211,25 @@ public struct Manifest: Codable, Sendable {
     /// retained so the Finder badge and the report can name them. Emptied as soon as every such
     /// path is NeoDrop's again (usually because the user moved their file aside).
     public var foreignPaths: [String]
+    /// The volume this replica was last written to (`VolumeGuard`). Kept so a later sync can tell
+    /// that the path now resolves to the boot disk while the share it used to be is gone, instead
+    /// of mirroring the source into whatever folder was left at the mount point.
+    public var volumeIdentifier: String?
 
     public init(replicaID: UUID, entries: [String: ManifestEntry] = [:], lastSync: Date? = nil,
-                lastVerify: Date? = nil, corruptPaths: [String] = [], foreignPaths: [String] = []) {
+                lastVerify: Date? = nil, corruptPaths: [String] = [], foreignPaths: [String] = [],
+                volumeIdentifier: String? = nil) {
         self.replicaID = replicaID
         self.entries = entries
         self.lastSync = lastSync
         self.lastVerify = lastVerify
         self.corruptPaths = corruptPaths
         self.foreignPaths = foreignPaths
+        self.volumeIdentifier = volumeIdentifier
     }
 
     private enum CodingKeys: String, CodingKey {
-        case replicaID, entries, lastSync, lastVerify, corruptPaths, foreignPaths
+        case replicaID, entries, lastSync, lastVerify, corruptPaths, foreignPaths, volumeIdentifier
     }
 
     /// Decode with defaults for keys an older build never wrote.
@@ -231,8 +237,9 @@ public struct Manifest: Codable, Sendable {
     /// The synthesized decoder throws on a missing key, and `ManifestStore.load` cannot tell “this
     /// file came from an older version” from “this file is damaged”: both come back as an empty
     /// manifest, which on a share means uploading every file again. So keys added after the first
-    /// release are optional on the way in — `corruptPaths`, and now `foreignPaths`. Encoding is
-    /// unchanged, and a test holds the old-file case (`testAManifestFromAnOlderBuildKeepsItsEntries`).
+    /// release are optional on the way in — `corruptPaths`, `foreignPaths`, and now
+    /// `volumeIdentifier`. Encoding is unchanged, and a test holds the old-file case
+    /// (`testAManifestFromAnOlderBuildKeepsItsEntries`).
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.replicaID = try container.decode(UUID.self, forKey: .replicaID)
@@ -241,6 +248,7 @@ public struct Manifest: Codable, Sendable {
         self.lastVerify = try container.decodeIfPresent(Date.self, forKey: .lastVerify)
         self.corruptPaths = try container.decodeIfPresent([String].self, forKey: .corruptPaths) ?? []
         self.foreignPaths = try container.decodeIfPresent([String].self, forKey: .foreignPaths) ?? []
+        self.volumeIdentifier = try container.decodeIfPresent(String.self, forKey: .volumeIdentifier)
     }
 
     public var totalBytes: Int64 { entries.values.reduce(0) { $0 + $1.size } }

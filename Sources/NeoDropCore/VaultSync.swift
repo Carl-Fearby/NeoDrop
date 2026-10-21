@@ -178,7 +178,8 @@ public actor VaultSync {
 
         // The safety rules that already govern replicas govern the vault too. A vault root that is
         // not there is an unmounted share, and creating it would sync onto the boot volume; a local
-        // folder that is not there is a missing volume, not an empty folder.
+        // folder that is not there is a missing volume, not an empty folder. "Not there" includes
+        // the folder a share leaves behind at its mount point — see `VolumeGuard`.
         //
         // Overlap is checked first because it is the configuration that must never be tolerated:
         // telling someone "the share is not mounted" when the real problem is a vault nested
@@ -186,7 +187,9 @@ public actor VaultSync {
         guard !Self.overlaps(link.localURL, link.vaultURL) else {
             return finish(&summary, phase: .failed("The folders overlap"), error: VaultError.foldersOverlap(link.localPath))
         }
-        guard Self.isUsableDirectory(link.vaultURL) else {
+        // A vault root is a share path by definition, so the boot-disk verdict is enough here: there
+        // is no "local folder on the internal disk" case to protect.
+        guard VolumeGuard.live.verdict(for: link.vaultURL) == .available else {
             return finish(&summary, phase: .failed("The vault is not available"), error: VaultError.vaultUnavailable(link.vaultPath))
         }
         guard Self.isUsableDirectory(link.localURL) else {

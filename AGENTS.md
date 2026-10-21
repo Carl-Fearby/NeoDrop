@@ -15,7 +15,7 @@ server and no cloud component.
 
 ```bash
 swift build                                        # compile everything
-swift test                                         # 268 engine tests, all green
+swift test                                         # 284 engine tests, all green
 swift run NeoDrop                                  # run the app (menu bar icon)
 swift build -c release --show-bin-path             # locate the release binary
 scripts/package.sh [--arch universal] [--no-dmg]   # .app + DMG, ad-hoc signed by default
@@ -54,9 +54,17 @@ behaviour, change the test only with a written reason.
 
 1. **Only manifest-tracked files are deleted from a replica.** Foreign files on a share are never
    touched (`testForeignFilesOnReplicaAreUntouched`).
-2. **A replica root is never created by the engine.** If the share is unmounted, the path must read
-   as offline — creating it would silently mirror onto the boot volume
-   (`testEngineNeverCreatesAMissingReplicaRoot`, `testReplicaPathThatIsAFileIsOffline`).
+2. **A replica root is never created by the engine, and a folder standing in for an unmounted
+   share is refused.** If the share is unmounted, the path must read as offline — creating it would
+   silently mirror onto the boot volume (`testEngineNeverCreatesAMissingReplicaRoot`,
+   `testReplicaPathThatIsAFileIsOffline`). Existence is not enough on its own: `VolumeGuard` also
+   refuses a root that resolves to the boot disk when the manifest records a different volume, or
+   when the path is under a mount root (`/Volumes`, `/Network`, `/private/var/automount`) — a folder
+   a share left behind at its mount point is exactly that shape. A replica that genuinely lives on
+   the boot disk (a local folder) is recorded as boot-volume and stays allowed
+   (`VolumeGuardTests`, including the measured stale-mount-point case in `scripts/e2e.sh --volumes`).
+   Do not weaken this to a warning: measured on macOS 27, a stale mount point plus an
+   unconditional sync mirrored the whole source onto the internal disk and reported success.
 3. **Deletions are refused when any source could not be read** (`testUnreadableSourceBlocksDeletions`).
 4. **The bulk-deletion guard stands by default.** More than 25% of a replica, or 25 files, in one run
    requires `allowBulkDeletions` (`testBulkDeletionIsRefusedByDefault`).
@@ -430,32 +438,52 @@ hands it URLs and the index hands it badge identifiers.
 `NEODROP_HOME` is deliberately **not** honoured: the extension is registered once for the installed
 app, and a scratch installation is not what the Finder showing the user's files should be about.
 
-### Status: the badge channel works, and needs a team signature
+### Status: two channels, and only one of them needs a team signature
 
-**Measured on macOS 26, and the channel was never the problem: the signature decides.** The app
+**The container file needs a team; loopback does not, and it is what an ad-hoc build uses.** The app
+serves the same encoded index on `127.0.0.1` — the first free port of 47_623…47_632, path
+`/badges.json` — and the extension fetches it with `com.apple.security.network.client`. A fixed port
+range is the whole discovery mechanism: the extension has nothing else to read. It answers only a
+loopback `Host` (403 otherwise), only `GET` on that one path (405/404), and 404 until the app has
+published an index, which the extension reads as "no badge" rather than "all good".
+`FinderStatusService` (`Sources/NeoDropShared/FinderStatusChannel.swift`) is the one definition of the
+range and path, compiled into both binaries; `BadgeIndexServer` (`NeoDropCore`, reused HTTP plumbing
+from `WebUIServer`) is the app side, and `scripts/verify.sh` fails a build where the two binaries
+disagree about the path or the extension lacks the entitlement.
+
+**A Mach service was tried first and does not work, which is worth not rediscovering.**
+`NSXPCListener(machServiceName:)` needs launchd to own the name (a launchd plist or an app service);
+a name registered by an ordinary process is not visible to a lookup. Measured both ways:
+`Connection init failed at lookup with error 3 - No such process` from a test process, and the same
+error from a real `.app` launched by LaunchServices with its bundle identifier as the service name.
+
+**Measured on macOS 26, and for the file the channel was never the problem: the signature decides.**
+The app
 publishes the index into the extension's own container because that is the only path a sandboxed
 extension can read. Since macOS 14 that container is protected from processes outside the *team* that
 owns it — macOS asks before an app reaches another developer's data container, and apps signed by one
 Team ID may reach each other's by default — and an ad-hoc signature carries no team at all:
 
-* **ad-hoc** (this repo's default build, and everything `swift run` produces): every write is refused,
-  logged as `Finder badges could not be updated: You don't have permission to save the file
-  “.finder-status.json.tmp-…” in the folder “NeoDrop”` (NSCocoaErrorDomain 513). The app carries on —
-  `publishFinderStatus` catches and logs it, because a stale badge must never stop a sync — so the only
-  symptom is badges that never appear, which is what made this look like a channel problem.
+* **ad-hoc** (this repo's default build): every write is refused, logged as `Finder badges could not
+  be updated: You don't have permission to save the file “.finder-status.json.tmp-…” in the folder
+  “NeoDrop”` (NSCocoaErrorDomain 513). The app carries on — `publishFinderStatus` catches and logs
+  it, because a stale badge must never stop a sync — and the loopback channel above is what makes
+  this harmless now. Before it existed, the only symptom was badges that never appeared, which is
+  what made a signing rule look like a channel problem.
 * **one team for both bundles** (`Apple Development: Carl Fearby`, team `JE22Z4DD8L`): `Finder badges
   updated: 0 folder(s), 0 needing attention`, and the container's `finder-status.json` is rewritten at
   launch (mtime == the launch second). `scripts/verify.sh` compares the two team identifiers and fails
   a build where they differ; an ad-hoc build is a note, because building without an Apple account is
   deliberate.
 
-The **launch path** is the second half, and it is easy to miss: the same binary publishes when
-LaunchServices starts it (`open -a`) and is refused when a shell starts it
+The **launch path** only matters to the file channel, and it is easy to miss: the same binary
+publishes when LaunchServices starts it (`open -a`) and is refused when a shell starts it
 (`NEODROP_HOME=… build/NeoDrop.app/Contents/MacOS/NeoDrop`), because the responsible process for a
-shell-started run is the shell, which carries no team. `swift run NeoDrop` therefore never badges
-anything even with a team signature: install it and let Finder start it. `scripts/e2e.sh` checks the
-container half that way — its own instance is shell-launched, so it asserts the refusal there, and its
-last section starts the installed app through `open` and asserts the publish.
+shell-started run is the shell, which carries no team. `scripts/e2e.sh` checks that half that way —
+its own instance is shell-launched, so it asserts the refusal there, and its last section starts the
+installed app through `open` and asserts the publish. Loopback is not affected by any of this: a
+shell-started app serves the same bytes on the same ports, so the launch path cannot be the reason a
+badge is missing.
 
 Containers themselves are containermanagerd's, and nothing else removes one: `rm`, `mv`, Finder and
 even `sudo rm -rf` are all refused (`Operation not permitted` on
@@ -474,9 +502,11 @@ What a sandboxed extension can read, measured by logging from inside the extensi
 | `~/Library/Group Containers/<group>` (as the unsandboxed app) | ❌ EPERM |
 
 It also does not receive a distributed notification posted by an unsandboxed process (measured:
-observer installed, notification posted, nothing delivered). So there is currently **no** file-based
-channel from the app to a Finder Sync extension: the extension must be sandboxed, the app cannot be
-(that is its whole job), and every readable location is either sealed or denied.
+observer installed, notification posted, nothing delivered). So there is **no file** the app can
+leave for a Finder Sync extension: the extension must be sandboxed, the app cannot be (that is its
+whole job), and every readable location is either sealed or denied. The two channels that do exist
+are the extension's own container (team identity required) and loopback (none required) — the first
+section of this heading.
 
 The marker test is gone, deliberately, and the reason is the point. It was left failing while the
 refusal looked like a platform wall with no way through. It is not a wall — it is a signature — so the
@@ -489,20 +519,26 @@ The other half of the old test — the app publishing *before* the extension has
 `save` to create the directory it needs — now runs against a scratch path in
 `testPublishingCreatesTheDirectoryItNeeds`, where it can be asserted rather than hoped for.
 
-What is still not built, and is the next real improvement:
+The loopback channel is tested over real HTTP (`FinderStatusTests`): the index served and decoded,
+nothing served before the first publish, a withdrawn index, a foreign `Host` (403), another path
+(404), a write (405), a version this build does not understand, and a client that gives up when
+nobody is listening. The app side is also checkable by hand — run any build, then
+`curl http://127.0.0.1:47623/badges.json`. What the tests cannot cover is the *extension* half, which
+only exists inside Finder: that it may connect at all (its `com.apple.security.network.client`
+entitlement) and that it pays no attention to the file when the file cannot be read. Confirming that
+needs an install, a registered extension, and a watching pass on `log stream` for
+"Badge index answered by the loopback channel".
 
-1. **An XPC Mach service.** The app registers `NSXPCListener(machServiceName:)` and the extension
-   connects with `com.apple.security.temporary-exception.mach-lookup.global-name` (Apple DTS: fine for
-   direct distribution, awkward on the App Store). No shared file at all, live updates, and it works
-   regardless of signatures — the entitlement lives on the extension, not on a team identity.
-2. **A loopback HTTP channel.** The app already serves a page on loopback; with
-   `com.apple.security.network.client` on the extension and a port it can find, the extension could
-   pull the index. Apple DTS says local-network privacy does not apply to loopback. Untested here.
-3. **A sandboxed app.** With the app sandboxed too, a team-signed App Group works properly — but the
-   app would then need user-selected bookmarks for every share, which changes the product.
+What is still not built here:
+
+1. **A channel that works on the App Store.** Loopback is fine for direct distribution, but a
+   sandboxed app on the store could not serve it to a sandboxed extension without the network-server
+   entitlement, and the store is not a target today.
+2. **A sandboxed app**, which would make a team-signed App Group work properly — but the app would
+   then need user-selected bookmarks for every share, which changes the product.
 
 Do not go back to "it works on a fresh install and dies at the first update": that was the ad-hoc
-signature all along. A channel is not what has to be right here — a signature is.
+signature all along, and it is now the file channel's problem only.
 
 ## The installer DMG
 

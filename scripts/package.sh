@@ -195,7 +195,8 @@ EXT_TMP="$BUILD/finder-extension"
 rm -rf "$EXT_TMP"
 mkdir -p "$EXT_TMP"
 EXT_SOURCES=("$ROOT/Sources/NeoDropFinder/SyncExtension.swift"
-             "$ROOT/Sources/NeoDropShared/FinderStatus.swift")
+             "$ROOT/Sources/NeoDropShared/FinderStatus.swift"
+             "$ROOT/Sources/NeoDropShared/FinderStatusChannel.swift")
 
 build_extension_arch() {
   local arch="$1" out="$2" objects="$EXT_TMP/objects-$1"
@@ -284,13 +285,14 @@ codesign --verify --strict --verbose=1 "$APP"
 
 if [ "$IDENTITY" = "-" ]; then
   info "ad-hoc signature: fine for this Mac, NOT accepted by Gatekeeper on other Macs"
-  # The badges are the second casualty, and a quieter one: macOS 14+ closes an app's data container to
-  # processes outside the team that owns it, and an ad-hoc signature carries no team at all, so the app
-  # is refused when it publishes the badge index into the extension's container. The app logs it
-  # ("Finder badges could not be updated …") and carries on, which is why it looks like a badge bug
-  # rather than a signing one. Signing both bundles with one identity is all it takes.
-  warn "ad-hoc signing also means no Finder badges: the app cannot write into the extension's container"
-  warn "  (macOS 14+ protects a container from other teams). Set MACOS_SIGN_IDENTITY to switch them on."
+  # Badges used to be the second casualty, and a quieter one: macOS 14+ closes an app's data
+  # container to processes outside the team that owns it, and an ad-hoc signature carries no team at
+  # all, so the app is refused when it publishes the badge index into the extension's container (it
+  # logs "Finder badges could not be updated …" and carries on). It no longer costs badges: the same
+  # index is served on loopback, which the extension may fetch without a team identity. What still
+  # needs an identity is the file channel — and Gatekeeper, above.
+  warn "ad-hoc signing: the extension's container is closed to us, so badges come over loopback instead"
+  warn "  (the app logs the refused container write; set MACOS_SIGN_IDENTITY to close that gap too)."
 fi
 
 # ---- optional notarization --------------------------------------------------------------------

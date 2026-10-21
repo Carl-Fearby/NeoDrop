@@ -12,7 +12,9 @@
 #   --volumes  additionally run the same app against three real mounted APFS volumes created by
 #              scripts/fake-nas.sh, because a folder under /tmp is not the same thing as a share
 #              under /Volumes: volume identity, the boot-volume guard and the same-volume warning
-#              only mean anything against genuinely separate mounts.
+#              only mean anything against genuinely separate mounts. It also ejects a throwaway
+#              volume and puts an empty folder back at its path, which is what a share that goes
+#              away leaves behind — the sync has to refuse that folder, not fill it.
 #
 # Exit status: 0 when every assertion passed, 1 otherwise, 2 on bad usage.
 
@@ -747,6 +749,92 @@ JSON
   rm -rf "/Volumes/NeoDropNAS1/NeoDrop-b" 2>/dev/null
   "$ROOT/scripts/fake-nas.sh" destroy >/dev/null 2>&1
   pass "fake NAS volumes detached and deleted"
+
+  # Scenario C: the share goes away and leaves a folder behind. A volume mounted at a custom mount
+  # point makes this reproducible without root: after an eject the mount point can survive as an
+  # ordinary empty directory on the boot disk, and the next sync used to mirror the whole source
+  # into it. The replica must be refused instead, and catch up once the volume is back.
+  STALESTATE="$WORK/stalestate"
+  STALEIMAGE="$WORK/stale-volume.asif"
+  STALEMNT="$WORK/stale-mnt"
+  mkdir -p "$STALESTATE" "$STALEMNT"
+  if diskutil image create blank --size 64m --volumeName NeoDropStale --fs APFS --format ASIF \
+       "$STALEIMAGE" >/dev/null 2>&1 \
+     && diskutil image attach --nobrowse --mountPoint "$STALEMNT" "$STALEIMAGE" >/dev/null 2>&1; then
+    pass "a throwaway volume is mounted at a custom mount point"
+    write_config "$STALESTATE" "[
+      { \"id\": \"99999999-9999-9999-9999-999999999999\", \"name\": \"Stale\", \"path\": \"$STALEMNT\", \"enabled\": true, \"priority\": 0 }
+    ]"
+
+    NEODROP_HOME="$STALESTATE" "$EXECUTABLE" > "$WORK/stale-mounted.log" 2>&1 &
+    CPID=$!
+    DEADLINE=$((SECONDS + 30))
+    while [ $SECONDS -lt $DEADLINE ]; do
+      [ -f "$STALEMNT/Documents/2026/plans.txt" ] && break
+      kill -0 "$CPID" 2>/dev/null || break
+      sleep 1
+    done
+    kill "$CPID" 2>/dev/null
+    wait "$CPID" 2>/dev/null
+    if [ -f "$STALEMNT/Documents/2026/plans.txt" ]; then
+      pass "the mounted volume received the mirror"
+    else
+      fail "the mounted volume did not receive the mirror"
+    fi
+
+    if diskutil eject "$STALEMNT" >/dev/null 2>&1; then
+      pass "the throwaway volume was ejected"
+    else
+      fail "could not eject the throwaway volume"
+    fi
+    # The stale mount point: the path is back, on the boot disk, and empty.
+    mkdir -p "$STALEMNT"
+    printf 'written while the share was away\n' > "$SOURCE/Documents/while-away.txt"
+    NEODROP_HOME="$STALESTATE" "$EXECUTABLE" > "$WORK/stale-ejected.log" 2>&1 &
+    EPID=$!
+    DEADLINE=$((SECONDS + 30))
+    while [ $SECONDS -lt $DEADLINE ]; do
+      grep -q "boot disk" "$STALESTATE/neodrop.log" 2>/dev/null && break
+      kill -0 "$EPID" 2>/dev/null || break
+      sleep 1
+    done
+    kill "$EPID" 2>/dev/null
+    wait "$EPID" 2>/dev/null
+    if [ -f "$STALEMNT/Documents/while-away.txt" ]; then
+      fail "the sync mirrored the source into the folder the ejected share left behind"
+    else
+      pass "nothing was written into the folder the ejected share left behind"
+    fi
+    if grep -q "folder on this Mac's boot disk" "$STALESTATE/neodrop.log" 2>/dev/null; then
+      pass "the report names the boot disk instead of pretending the share is there"
+    else
+      fail "the refusal did not say the folder is on the boot disk"
+    fi
+
+    if diskutil image attach --nobrowse --mountPoint "$STALEMNT" "$STALEIMAGE" >/dev/null 2>&1; then
+      NEODROP_HOME="$STALESTATE" "$EXECUTABLE" > "$WORK/stale-back.log" 2>&1 &
+      BPID=$!
+      DEADLINE=$((SECONDS + 30))
+      while [ $SECONDS -lt $DEADLINE ]; do
+        [ -f "$STALEMNT/Documents/while-away.txt" ] && break
+        kill -0 "$BPID" 2>/dev/null || break
+        sleep 1
+      done
+      kill "$BPID" 2>/dev/null
+      wait "$BPID" 2>/dev/null
+      if [ -f "$STALEMNT/Documents/while-away.txt" ]; then
+        pass "the file missed while the share was away landed when it came back"
+      else
+        fail "the share came back but the missed file was not copied"
+      fi
+      diskutil eject "$STALEMNT" >/dev/null 2>&1
+    else
+      fail "could not reattach the throwaway volume"
+    fi
+    rm -f "$STALEIMAGE"
+  else
+    fail "could not mount a throwaway volume at a custom mount point"
+  fi
 fi
 
 # ---- the badge channel, launched the way a user's Mac launches it --------------------------------

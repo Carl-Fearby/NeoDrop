@@ -20,14 +20,19 @@ public actor MirrorEngine {
     private let runtimeStore: RuntimeStateStore
     private let sourceIndexStore: SourceIndexStore
     private let indexer = SourceIndexer()
+    /// Distinguishes a mounted share from a folder left at its mount point. Injectable so tests can
+    /// describe a volume layout without a real second disk, and so an unmounted share can be
+    /// asserted rather than hoped for.
+    private let volumes: VolumeGuard
 
     private var running = false
 
-    public init(paths: StorePaths = .standard) {
+    public init(paths: StorePaths = .standard, volumes: VolumeGuard = .live) {
         self.paths = paths
         self.manifestStore = ManifestStore(paths: paths)
         self.runtimeStore = RuntimeStateStore(paths: paths)
         self.sourceIndexStore = SourceIndexStore(paths: paths)
+        self.volumes = volumes
     }
 
     public var isRunning: Bool { running }
@@ -40,7 +45,9 @@ public actor MirrorEngine {
         return config.replicas.map { replica in
             let state = runtime.runtime(for: replica.id)
             let manifest = manifestStore.load(replicaID: replica.id)
-            let reachable = Self.isUsableDirectory(replica.url)
+            let reachable = volumes.verdict(
+                for: replica.url, lastVolumeIdentifier: manifest.volumeIdentifier
+            ) == .available
             var snapshot = ReplicaSnapshot(
                 replica: replica,
                 status: !replica.enabled ? .disabled : (reachable ? (state.status == .unknown ? .unknown : state.status) : .offline),
@@ -145,9 +152,9 @@ public actor MirrorEngine {
             var manifest = manifestStore.load(replicaID: replica.id)
             var report = ReplicaReport(id: replica.id, name: replica.displayName, status: .unknown)
 
-            guard Self.isUsableDirectory(replica.url) else {
+            if let reason = unavailableReason(for: replica, manifest: manifest) {
                 report.status = .offline
-                report.errors.append("Replica folder is not available")
+                report.errors.append(reason)
                 summary.replicas.append(report)
                 continue
             }
@@ -308,14 +315,13 @@ public actor MirrorEngine {
     ) async -> ReplicaReport {
         var report = ReplicaReport(id: replica.id, name: replica.displayName, status: .unknown)
 
-        guard Self.isUsableDirectory(replica.url) else {
+        var manifest = manifestStore.load(replicaID: replica.id)
+        if let reason = unavailableReason(for: replica, manifest: manifest) {
             report.status = .offline
-            report.errors.append("Replica folder is not available — is the share mounted?")
+            report.errors.append(reason)
             report.failed = plan.files.count
             return report
         }
-
-        var manifest = manifestStore.load(replicaID: replica.id)
 
         // Retention bookkeeping, run on every sync regardless of `mirrorDeletions`: a record
         // whose file is genuinely back in the source (same digest — the plan already hashed it)
@@ -557,6 +563,9 @@ public actor MirrorEngine {
 
         manifest.lastSync = Date()
         manifest.replicaID = replica.id
+        // Remember where these bytes went, so the next sync can tell this share from a folder that
+        // was left at its mount point (see `unavailableReason`).
+        manifest.volumeIdentifier = volumes.identifier(replica.url)
         // Replaced rather than appended to: a path that is NeoDrop's again has stopped being an
         // exception, and a stale entry would keep badging a file that is now perfectly in sync.
         manifest.foreignPaths = foreign
@@ -574,6 +583,22 @@ public actor MirrorEngine {
         return report
     }
 
+    /// Why this replica must not be written to right now, or nil when it may be.
+    ///
+    /// `missing` and `folderOnBootDisk` are deliberately different sentences. The second one is not
+    /// an empty share: it is the internal disk standing in for one, and saying "not mounted" would
+    /// hide the fact that the folder is right there, it is just the wrong volume.
+    private func unavailableReason(for replica: Replica, manifest: Manifest) -> String? {
+        switch volumes.verdict(for: replica.url, lastVolumeIdentifier: manifest.volumeIdentifier) {
+        case .available:
+            return nil
+        case .missing:
+            return "Replica folder is not available — is the share mounted?"
+        case .folderOnBootDisk:
+            return "Replica folder is a folder on this Mac's boot disk, not a mounted share, so nothing was written to it. Mount the share to sync; if you meant this destination to be a local folder, remove it and add it again."
+        }
+    }
+
     /// List the recorded foreign paths, including offline or otherwise unreplaceable conflicts.
     /// Hashing is bounded to just the conflicts the user opened, not the whole mirror. The hash is
     /// returned for optimistic concurrency: replace refuses if those exact bytes have since changed.
@@ -582,7 +607,9 @@ public actor MirrorEngine {
             let manifest = manifestStore.load(replicaID: replica.id)
             return manifest.foreignPaths.sorted().map { relativePath in
                 let url = replica.url.appendingPathComponent(relativePath)
-                let available = replica.enabled && Self.isUsableDirectory(replica.url)
+                let available = replica.enabled && volumes.verdict(
+                    for: replica.url, lastVolumeIdentifier: manifest.volumeIdentifier
+                ) == .available
                 let isFile = available && FileManager.default.fileExists(atPath: url.path)
                     && !FileMeta.isDirectory(url)
                 let source = Self.sourceFile(forMirroredPath: relativePath, config: config)
@@ -640,11 +667,13 @@ public actor MirrorEngine {
         guard Self.isSafeRelativePath(relativePath),
               expectedForeignSHA256.count == 64,
               expectedForeignSHA256.allSatisfy({ $0.isHexDigit }),
-              let replica = config.enabledReplicas.first(where: { $0.id == replicaID }),
-              Self.isUsableDirectory(replica.url) else {
+              let replica = config.enabledReplicas.first(where: { $0.id == replicaID }) else {
             throw NeoDropError.foreignCopyUnavailable(relativePath)
         }
         var manifest = manifestStore.load(replicaID: replica.id)
+        guard unavailableReason(for: replica, manifest: manifest) == nil else {
+            throw NeoDropError.foreignCopyUnavailable(relativePath)
+        }
         guard manifest.foreignPaths.contains(relativePath) else {
             throw NeoDropError.foreignCopyChanged(relativePath)
         }
@@ -996,11 +1025,17 @@ public actor MirrorEngine {
         var isAvailable: Bool
     }
 
-    static func deleteDestinations(config: AppConfig) -> [DeleteDestination] {
-        config.replicas.map {
-            DeleteDestination(id: $0.id, name: $0.displayName, root: $0.url, isAvailable: isUsableDirectory($0.url))
+    func deleteDestinations(config: AppConfig) -> [DeleteDestination] {
+        config.replicas.map { replica in
+            DeleteDestination(
+                id: replica.id, name: replica.displayName, root: replica.url,
+                isAvailable: volumes.verdict(
+                    for: replica.url,
+                    lastVolumeIdentifier: manifestStore.load(replicaID: replica.id).volumeIdentifier
+                ) == .available
+            )
         } + config.vaults.map {
-            DeleteDestination(id: $0.id, name: $0.displayName, root: $0.localURL, isAvailable: isUsableDirectory($0.localURL))
+            DeleteDestination(id: $0.id, name: $0.displayName, root: $0.localURL, isAvailable: Self.isUsableDirectory($0.localURL))
         }
     }
 
@@ -1017,7 +1052,7 @@ public actor MirrorEngine {
         var recordsByPath: [String: [DeleteRecord]] = [:]
         var copiesByPath: [String: [DeletionCopy]] = [:]
 
-        for destination in Self.deleteDestinations(config: config) {
+        for destination in deleteDestinations(config: config) {
             let records = store.load(replicaID: destination.id)
             guard !records.isEmpty else { continue }
             // A reachable destination with a retained copy is what makes an entry restorable;
@@ -1094,7 +1129,7 @@ public actor MirrorEngine {
     public func restore(relativePath: String, config: AppConfig) throws -> URL {
         let store = DeleteStore(paths: paths)
         let fm = FileManager.default
-        let destinations = Self.deleteDestinations(config: config)
+        let destinations = deleteDestinations(config: config)
 
         var recordByDestination: [UUID: DeleteRecord] = [:]
         for destination in destinations {
@@ -1192,7 +1227,7 @@ public actor MirrorEngine {
     private func newerVersionIsOnAReplica(relativePath: String, fileAt file: URL, config: AppConfig) -> Bool {
         guard let size = FileMeta.size(ofFileAt: file),
               let digest = try? Hashing.sha256(ofFileAt: file) else { return false }
-        for destination in Self.deleteDestinations(config: config) where destination.isAvailable {
+        for destination in deleteDestinations(config: config) where destination.isAvailable {
             let copy = destination.root.appendingPathComponent(relativePath)
             guard FileMeta.size(ofFileAt: copy) == size,
                   let digestOnReplica = try? Hashing.sha256(ofFileAt: copy),
@@ -1214,7 +1249,7 @@ public actor MirrorEngine {
         let now = Date()
         var purged = 0
 
-        for destination in Self.deleteDestinations(config: config) {
+        for destination in deleteDestinations(config: config) {
             // An unmounted share must be skipped, not treated as empty: its retained copies are
             // still there, and dropping the records now would orphan them forever.
             guard destination.isAvailable else { continue }
@@ -1298,7 +1333,7 @@ public actor MirrorEngine {
     private func discardRetainedCopies(relativePath: String, config: AppConfig) {
         let store = DeleteStore(paths: paths)
         let fm = FileManager.default
-        for destination in Self.deleteDestinations(config: config) {
+        for destination in deleteDestinations(config: config) {
             guard destination.isAvailable else { continue }
             let records = store.load(replicaID: destination.id)
             guard records.contains(where: { $0.relativePath == relativePath }) else { continue }

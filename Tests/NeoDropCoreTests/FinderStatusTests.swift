@@ -15,6 +15,8 @@ final class FinderStatusTests: XCTestCase {
     }
 
     override func tearDown() {
+        server?.stop()
+        server = nil
         sandbox = nil
     }
 
@@ -349,5 +351,148 @@ final class FinderStatusTests: XCTestCase {
         XCTAssertTrue(built.exceptions.isEmpty)
         XCTAssertLessThan(try JSONEncoder().encode(built).count, 2048,
                           "the published file stays small however many files are protected")
+    }
+
+    // MARK: - The channel an ad-hoc build badges over
+    //
+    // The app serves the index on loopback because the extension's container is closed to a bundle
+    // with no team identity. These exercise the real server and the real client over real HTTP — the
+    // same code path the installed app and the Finder extension use — so a wrong path, a lost reply
+    // or a hung request is a test failure rather than a badge that silently never appears.
+    //
+    // A range of its own, not the shipping one: the production ports may well be bound by the
+    // NeoDrop the developer has running, and a test that silently read *that* app's index would pass
+    // no matter what this code does.
+    private static let testPortRange: ClosedRange<UInt16> = 47_700...47_704
+
+    private var server: BadgeIndexServer?
+
+    @discardableResult
+    private func startServer() throws -> UInt16 {
+        let server = BadgeIndexServer(portRange: Self.testPortRange)
+        self.server = server
+        return try XCTUnwrap(server.start(), "no port in the test range could be bound")
+    }
+
+    private func client() -> FinderStatusClient {
+        FinderStatusClient(portRange: Self.testPortRange, perPortTimeout: 2)
+    }
+
+    /// Compared field by field rather than whole: the transport uses the same ISO-8601 whole-second
+    /// dates as the file, so `generatedAt` comes back truncated by design.
+    private func assertSameIndex(_ fetched: FinderStatusIndex?, _ expected: FinderStatusIndex,
+                                file: StaticString = #filePath, line: UInt = #line) {
+        guard let fetched else {
+            XCTFail("the channel answered nothing", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(fetched.version, expected.version, file: file, line: line)
+        XCTAssertEqual(fetched.machineName, expected.machineName, file: file, line: line)
+        XCTAssertEqual(fetched.roots, expected.roots, file: file, line: line)
+        XCTAssertEqual(fetched.exceptions, expected.exceptions, file: file, line: line)
+    }
+
+    func testTheLoopbackChannelServesTheIndexTheAppPublished() throws {
+        try startServer()
+        let published = build()
+        server?.publish(published)
+
+        let fetched = client().fetchIndex()
+        assertSameIndex(fetched, published)
+        XCTAssertEqual(fetched?.badge(for: sandbox.sourceFile("anything.txt").path), .synced,
+                       "and it still answers badge questions after the round trip")
+    }
+
+    /// The important half of "no index yet": the extension must show no badge, not a green tick. A
+    /// silent 404 and an unreachable port both become nil here, which is what sends the extension
+    /// back to the file.
+    func testTheLoopbackChannelAnswersNothingBeforeTheFirstPublish() throws {
+        try startServer()
+        XCTAssertNil(client().fetchIndex())
+    }
+
+    func testWithdrawingTheIndexStopsTheChannelAnswering() throws {
+        try startServer()
+        server?.publish(build())
+        XCTAssertNotNil(client().fetchIndex())
+
+        server?.withdraw()
+        XCTAssertNil(client().fetchIndex(), "a stopped sync must not keep serving the last thing it knew")
+    }
+
+    /// A newer NeoDrop may mean something this build cannot say, and a wrong badge is worse than no
+    /// badge — the same rule the file channel applies.
+    func testAnIndexFromAFutureVersionIsRefusedOverTheChannel() throws {
+        try startServer()
+        var future = build()
+        future.version = FinderStatusIndex.currentVersion + 1
+        server?.publish(future)
+
+        XCTAssertNil(client().fetchIndex())
+    }
+
+    /// A page on another site reaching for the port (DNS rebinding) is refused, which is the one
+    /// guard the fixed port makes necessary: without it, any local lookup could read a list of the
+    /// user's folders.
+    func testTheChannelRefusesAForeignHostHeader() throws {
+        let port = try startServer()
+        server?.publish(build())
+
+        var request = URLRequest(url: try XCTUnwrap(FinderStatusService.url(port: port)))
+        request.setValue("evil.example", forHTTPHeaderField: "Host")
+        let (_, response) = try sync(request)
+        XCTAssertEqual(response.statusCode, 403)
+    }
+
+    func testTheChannelServesOnlyItsOwnPathAndVerb() throws {
+        let port = try startServer()
+        server?.publish(build())
+
+        let elsewhere = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/anything-else"))
+        let other = try sync(URLRequest(url: elsewhere))
+        XCTAssertEqual(other.1.statusCode, 404)
+
+        var wrongVerb = URLRequest(url: try XCTUnwrap(FinderStatusService.url(port: port)))
+        wrongVerb.httpMethod = "POST"
+        let post = try sync(wrongVerb)
+        XCTAssertEqual(post.1.statusCode, 405, "the channel serves one read-only path")
+    }
+
+    /// Finder is not waiting on this call, but a poll that never returns would still pile up: no
+    /// app, or a port nobody answers on, has to end.
+    func testTheClientGivesUpWhenNothingIsListening() {
+        let started = Date()
+        XCTAssertNil(FinderStatusClient(portRange: Self.testPortRange, perPortTimeout: 0.2).fetchIndex())
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+    }
+
+    /// URLSession with a semaphore: these tests are about what the server answers, not about
+    /// asynchronous plumbing, and the client under test does the same thing.
+    private func sync(_ request: URLRequest,
+                      file: StaticString = #filePath, line: UInt = #line) throws -> (Data, HTTPURLResponse) {
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = HTTPAnswer()
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            box.data = data
+            box.response = response as? HTTPURLResponse
+            box.error = error
+            semaphore.signal()
+        }
+        task.resume()
+        guard semaphore.wait(timeout: .now() + 10) == .success else {
+            XCTFail("the server never answered", file: file, line: line)
+            throw URLError(.timedOut)
+        }
+        guard let response = box.response else {
+            XCTFail("no HTTP response: \(box.error?.localizedDescription ?? "unknown")", file: file, line: line)
+            throw URLError(.badServerResponse)
+        }
+        return (box.data ?? Data(), response)
+    }
+
+    private final class HTTPAnswer: @unchecked Sendable {
+        var data: Data?
+        var response: HTTPURLResponse?
+        var error: Error?
     }
 }

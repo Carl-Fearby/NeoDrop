@@ -130,12 +130,14 @@ check "signature validates strictly" "codesign --verify --strict '$APP'"
 #   * an extension that is not sandboxed is refused by PlugInKit ("plug-ins must be sandboxed", in
 #     the system log only);
 #   * a sandboxed extension cannot read the app's Application Support directory, so without a channel
-#     it registers, runs and badges nothing. The channel is the extension's own container, which the
-#     app writes from outside — and which macOS 14+ closes to any process outside the *team* that owns
-#     it, so an ad-hoc signed app is refused ("You don't have permission to save the file …") and the
-#     badges stay dark. An App Group is *not* the channel: `~/Library/Group Containers` is closed to a
-#     non-sandboxed process, so an app-group entitlement makes the app look entitled while the index
-#     never lands — the checks below refuse it rather than leave that to be rediscovered;
+#     it registers, runs and badges nothing. There are two, and they are checked separately below:
+#     the extension's own container, which the app writes from outside and which macOS 14+ closes to
+#     any process outside the *team* that owns it (an ad-hoc app is refused with "You don't have
+#     permission to save the file …"), and a Mach service the app vends, which needs no team at all
+#     because the permission is a temporary exception on the extension's side. An App Group is *not*
+#     a channel: `~/Library/Group Containers` is closed to a non-sandboxed process, so an app-group
+#     entitlement makes the app look entitled while the index never lands — the checks below refuse
+#     it rather than leave that to be rediscovered;
 #   * a plist naming a class the binary does not export gives an extension that loads and does
 #     nothing.
 #
@@ -170,7 +172,7 @@ check "Finder extension is signed" "codesign --verify --strict '$APPEX'"
 APP_TEAM="$(codesign -dvv "$APP" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2}')"
 EXTENSION_TEAM="$(codesign -dvv "$APPEX" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2}')"
 if [ "$APP_TEAM" = "not set" ] && [ "$EXTENSION_TEAM" = "not set" ]; then
-  note "signed ad-hoc: no team, so macOS 14+ refuses the app's writes into the extension's container and the badges stay dark (build with MACOS_SIGN_IDENTITY to switch them on)"
+  note "signed ad-hoc: no team, so macOS 14+ refuses the app's writes into the extension's container — badges come over loopback instead, which needs no team (build with MACOS_SIGN_IDENTITY for the file channel too)"
 elif [ "$APP_TEAM" = "$EXTENSION_TEAM" ]; then
   pass "app and extension share a team ($APP_TEAM), so the badge index can reach the extension"
 else
@@ -186,6 +188,21 @@ check "Finder extension carries the App Sandbox entitlement PlugInKit requires" 
 check "neither bundle declares an App Group (it cannot be written by a non-sandboxed app)" \
   "! codesign -d --entitlements - --xml '$APPEX' 2>/dev/null | grep -q 'application-groups' \
      && ! codesign -d --entitlements - --xml '$APP' 2>/dev/null | grep -q 'application-groups'"
+# Loopback is the channel a build with no team identity has: the app serves the index on a fixed
+# port range and the extension fetches it. Both sides compile the same shared file, so the channel's
+# path is a real string in both binaries — which is what makes a rename on one side checkable rather
+# than a silently dead channel. Without the outgoing-connection entitlement the fetch fails with no
+# diagnostic beyond a nil, so that is checked on the signature.
+CHANNEL_PATH="$(sed -n 's/.*static let path = "\([^"]*\)".*/\1/p' "$ROOT/Sources/NeoDropShared/FinderStatusChannel.swift" | head -1)"
+check "the badge channel names a path in the source" "[ -n '$CHANNEL_PATH' ]"
+check "the app binary serves the badge path the extension asks for" \
+  "[[ \"\$(strings -a '$EXECUTABLE')\" == *'$CHANNEL_PATH'* ]]"
+check "the Finder extension binary asks for the badge path the app serves" \
+  "[[ \"\$(strings -a '$EXTENSION_BINARY')\" == *'$CHANNEL_PATH'* ]]"
+check "Finder extension may open the loopback connection the badge channel needs" \
+  "codesign -d --entitlements - --xml '$APPEX' 2>/dev/null | plutil -p - | grep -q 'com.apple.security.network.client'"
+check "Finder extension declares no network server or file entitlement (it only asks)" \
+  "! codesign -d --entitlements - --xml '$APPEX' 2>/dev/null | plutil -p - | grep -qE 'network.server|files.user-selected|files.home-relative|mach-lookup'"
 # The app publishes into the container named after the extension's bundle identifier, so the two have
 # to be the same string on the built artefact, not just in the source. Renaming the extension in its
 # Info.plist without the constant in FinderStatus.swift would leave badges silently dead.

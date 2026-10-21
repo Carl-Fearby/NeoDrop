@@ -1,35 +1,44 @@
 import AppKit
 import FinderSync
+import os
 
 /// The badge in Finder, next to a file's date — the "is this protected?" glance.
 ///
-/// This runs inside Finder, in its own process, with no way to ask the app anything: it may start
-/// before the app, outlive it, or run while the app is busy. So the app publishes what it knows as a
-/// small file (`FinderStatusIndex`) and this reads it. Everything here is therefore a lookup, never a
-/// walk and never a hash — Finder asks for badges while scrolling, and a badge that takes a directory
-/// enumeration to answer is a badge that makes the Finder stutter.
+/// This runs inside Finder, in its own process, with no way to walk the user's folders: it may start
+/// before the app, outlive it, or run while the app is busy. So the app publishes what it knows, and
+/// this looks it up. Everything here is therefore a lookup, never a walk and never a hash — Finder
+/// asks for badges while scrolling, and a badge that takes a directory enumeration to answer is a
+/// badge that makes the Finder stutter.
 ///
-/// It reads the index from its own sandbox container — the one place a sandboxed process may read,
-/// and where the app publishes it from outside, provided the two bundles share a team identity (see
-/// `FinderStatusIndex.extensionIndexURL` for the measurements behind both, and for why an App Group
-/// cannot be used). It does not read the app's own
-/// state directory, which the sandbox would refuse anyway, and it does not follow `NEODROP_HOME`: the
-/// extension is registered once for the installed app, and a second installation (which the end-to-end
-/// scripts use) is not what the Finder showing the user's files should be about.
+/// Two channels, in this order:
+///
+/// 1. **The file**, in its own sandbox container — the one place a sandboxed process may read, and
+///    where a team-signed app can write from outside. See `FinderStatusIndex.extensionIndexURL` for
+///    the measurements and for why an App Group cannot be used.
+/// 2. **Loopback HTTP**, when the file is not there or is closed to us — which is the whole case for
+///    an ad-hoc build, where no team identity means nothing can be written into the container. The
+///    app listens on a fixed small port range and this probes it; see `FinderStatusService`.
+///
+/// It does not read the app's own state directory, which the sandbox would refuse anyway, and it
+/// does not follow `NEODROP_HOME`: the extension is registered once for the installed app, and a
+/// second installation (which the end-to-end scripts use) is not what the Finder showing the user's
+/// files should be about.
 @objc(NeoDropFinderExtension)
 final class NeoDropFinderExtension: FIFinderSync {
     private var indexURL: URL? { FinderStatusIndex.extensionIndexURL() }
 
     private var index: FinderStatusIndex?
-    /// The index file's modification date when it was read, so a reload can be skipped.
-    private var indexStamp: Date?
     /// The URLs Finder has asked about, newest last, so a change to the index can be pushed to what is
     /// on screen. Bounded: an extension that remembers every file in a 4 TB library is a leak.
     private var seen: [String: Date] = [:]
     private static let rememberedLimit = 20_000
-    /// Polling, not FSEvents: the index is one small file written by another process, and a stat every
-    /// couple of seconds is cheaper than a watched-directory setup for a single path.
+    /// Polling, not FSEvents: the index is one small answer written by another process, and asking
+    /// every couple of seconds is cheaper than a watched-directory setup for a single path.
     private var timer: DispatchSourceTimer?
+    private let client = FinderStatusClient()
+    private let log = Logger(subsystem: FinderStatusIndex.extensionBundleIdentifier, category: "badges")
+    /// Which channel answered last, so a switch is logged once rather than every poll.
+    private var channel = "none"
 
     override init() {
         super.init()
@@ -37,7 +46,7 @@ final class NeoDropFinderExtension: FIFinderSync {
         for badge in FinderBadge.allCases {
             controller.setBadgeImage(Self.image(for: badge), label: badge.label, forBadgeIdentifier: badge.rawValue)
         }
-        reloadIndex()
+        refreshFromBestChannel()
         applyWatchedDirectories()
         startWatching()
     }
@@ -107,29 +116,48 @@ final class NeoDropFinderExtension: FIFinderSync {
         timer.schedule(deadline: .now() + 2, repeating: 2)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            self.reloadIndexIfChanged()
+            self.refreshFromBestChannel()
         }
         timer.resume()
         self.timer = timer
     }
 
-    private func reloadIndex() {
-        guard let url = indexURL else {
-            index = nil
-            indexStamp = nil
+    /// The file first — it is one stat and it is what a team-signed build has always used — then the
+    /// loopback channel, which is the only one an ad-hoc build can have. Nil from either is not an
+    /// error: the app may be starting, may have published nothing yet, or may not be running.
+    private func refreshFromBestChannel() {
+        // The file the extension can read (a team-signed app wrote it) — one read, no probing.
+        if let file = indexURL.flatMap(FinderStatusIndex.load(from:)) {
+            announce("file")
+            apply(file)
             return
         }
-        indexStamp = Self.modificationDate(of: url)
-        index = FinderStatusIndex.load(from: url)
+        // An ad-hoc build can write no file here, so ask the app over loopback. Nil means the app is
+        // not running, has published nothing, or all ten ports are somebody else's.
+        if let live = client.fetchIndex() {
+            announce("loopback")
+            apply(live)
+            return
+        }
+        announce("none")
     }
 
-    private func reloadIndexIfChanged() {
-        guard let url = indexURL else { return }
-        let stamp = Self.modificationDate(of: url)
-        guard stamp != indexStamp else { return }
-        reloadIndex()
+    /// Swap in an index only when it says something different. Re-applying an unchanged index would
+    /// re-assign `directoryURLs` every two seconds, which makes Finder re-ask about every open window
+    /// for no reason.
+    private func apply(_ new: FinderStatusIndex) {
+        guard new != index else { return }
+        index = new
         applyWatchedDirectories()
         pushBadges()
+    }
+
+    /// One line per channel change, so `log stream` answers "which channel answered?" without
+    /// guessing — and so a channel that starts failing is visible rather than silent.
+    private func announce(_ answered: String) {
+        guard channel != answered else { return }
+        channel = answered
+        log.info("Badge index answered by the \(answered, privacy: .public) channel")
     }
 
     /// Tell Finder which directories are NeoDrop's — and tell it again every time the index changes.
@@ -180,10 +208,6 @@ final class NeoDropFinderExtension: FIFinderSync {
         // Drop the oldest half rather than one at a time: this runs in Finder's scroll path.
         let oldest = seen.sorted { $0.value < $1.value }.prefix(Self.rememberedLimit / 2)
         for entry in oldest { seen[entry.key] = nil }
-    }
-
-    private static func modificationDate(of url: URL) -> Date? {
-        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
     }
 
     // MARK: - Badge artwork
